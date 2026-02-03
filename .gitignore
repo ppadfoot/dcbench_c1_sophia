@@ -1,0 +1,27 @@
+# datasets
+data/
+
+# training outputs
+runs/
+figs/
+overleaf_figs/
+
+# checkpoints / tensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.npz
+
+# plots and reports (обычно генерируются)
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# python junk
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+.venv/

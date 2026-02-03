@@ -1,0 +1,21 @@
+# Core
+numpy>=1.23
+scipy>=1.10
+matplotlib>=3.7
+pandas>=2.0
+
+# Training
+torch>=2.0
+tqdm
+
+# Data
+datasets>=2.14
+tiktoken>=0.5
+
+# Optimizers (Option A)
+# Lion (PyPI package)
+lion-pytorch>=0.1.2
+# Muon (official repo)
+git+https://github.com/KellerJordan/Muon.git
+# LAMB (widely-used implementation)
+git+https://github.com/cybertronai/pytorch-lamb.git
