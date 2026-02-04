@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Tuple
 
+import importlib
+import inspect
 import torch
 
 
@@ -16,19 +18,13 @@ class DecayGroups:
 
 
 def split_decay_params(model: torch.nn.Module) -> DecayGroups:
-    """Split parameters into (decay, no_decay) like nanoGPT.
-
-    We do NOT rely on optimizer-internal `weight_decay`. Instead, we apply
-    decoupled weight decay externally, and we typically don't decay:
-    biases, LayerNorm/BatchNorm parameters, and similar scale/bias terms.
-    """
+    """nanoGPT-style decay split (we keep WD external in train.py)."""
     decay: List[torch.nn.Parameter] = []
     no_decay: List[torch.nn.Parameter] = []
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # common exclusions
         if name.endswith(".bias"):
             no_decay.append(p)
         elif name.endswith(".weight") and ("ln" in name.lower() or "norm" in name.lower()):
@@ -41,20 +37,56 @@ def split_decay_params(model: torch.nn.Module) -> DecayGroups:
     return DecayGroups(decay=decay, no_decay=no_decay)
 
 
-def apply_decoupled_weight_decay(groups: DecayGroups, weight_decay: float, lr: float) -> None:
-    """Apply decoupled weight decay (AdamW-style) to *decay* parameters only."""
-    if weight_decay is None or weight_decay <= 0:
-        return
-    if lr is None or lr <= 0:
-        return
-    with torch.no_grad():
-        for p in groups.decay:
-            p.mul_(1.0 - lr * weight_decay)
-
-
 def _import_symbol(module: str, symbol: str):
-    mod = __import__(module, fromlist=[symbol])
+    mod = importlib.import_module(module)
     return getattr(mod, symbol)
+
+
+def _find_lamb_class():
+    candidates = [
+        ("pytorch_lamb", "Lamb"),
+        ("pytorch_lamb.lamb", "Lamb"),
+        ("torch_optimizer", "Lamb"),
+        ("torch_optimizer.lamb", "Lamb"),
+    ]
+    last = None
+    for mod, sym in candidates:
+        try:
+            return _import_symbol(mod, sym)
+        except Exception as e:
+            last = e
+    raise ImportError(
+        "Could not import LAMB optimizer.\n"
+        "Install one of:\n"
+        "  python -m pip install -U git+https://github.com/cybertronai/pytorch-lamb.git\n"
+        "  python -m pip install -U torch-optimizer\n"
+    ) from last
+
+
+def _muon_param_partition_for_gpt(model: torch.nn.Module):
+    """Partition params for Muon like official guidance:
+    - Muon only for hidden 2D weights inside transformer blocks
+    - Adam (aux) for embeddings/head and all 1D params
+    """
+    muon_params: List[torch.nn.Parameter] = []
+    aux_params: List[torch.nn.Parameter] = []
+
+    seen = set()
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+
+        # GPT in this repo names blocks as "transformer.h.<i>...."
+        if name.startswith("transformer.h.") and p.ndim >= 2:
+            muon_params.append(p)
+        else:
+            aux_params.append(p)
+
+    return muon_params, aux_params
 
 
 def make_optimizer(
@@ -66,97 +98,75 @@ def make_optimizer(
     eps: float = 1e-8,
     momentum: float = 0.9,
     rho: float = 0.1,
-    interval: int = 10,
-    variant: int = 4,
     muon_momentum: float = 0.95,
-) -> Tuple[torch.optim.Optimizer, DecayGroups, Dict[str, Any]]:
-    """Create an optimizer instance.
-
-    Notes
-    -----
-    - We keep weight_decay=0 in optimizers and apply decoupled WD externally.
-    - This function returns (optimizer, decay_groups, extra_dict).
-      `extra_dict` is used for things like Sophia's per-step batch-size.
-    """
-
-    decay_groups = split_decay_params(model)
-
-    # param groups for optimizer (no internal decay)
-    param_groups = [
-        {"params": decay_groups.decay, "weight_decay": 0.0},
-        {"params": decay_groups.no_decay, "weight_decay": 0.0},
+) -> torch.optim.Optimizer:
+    """Create optimizer. Weight decay is kept at 0 inside optimizers."""
+    dg = split_decay_params(model)
+    param_groups_std = [
+        {"params": dg.decay, "weight_decay": 0.0},
+        {"params": dg.no_decay, "weight_decay": 0.0},
     ]
-
-    extra: Dict[str, Any] = {}
 
     name_l = name.lower()
 
     if name_l == "adamw":
-        opt = torch.optim.AdamW(param_groups, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
-        return opt, decay_groups, extra
+        return torch.optim.AdamW(param_groups_std, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
 
     if name_l == "sgd":
-        # vanilla SGD + momentum (no nesterov by default)
-        opt = torch.optim.SGD(param_groups, lr=lr, momentum=momentum, dampening=0.0, weight_decay=0.0, nesterov=False)
-        return opt, decay_groups, extra
+        return torch.optim.SGD(param_groups_std, lr=lr, momentum=momentum, dampening=0.0, weight_decay=0.0, nesterov=False)
 
     if name_l == "lion":
-        # PyPI: lion-pytorch
         Lion = _import_symbol("lion_pytorch", "Lion")
-        opt = Lion(param_groups, lr=lr, betas=betas, weight_decay=0.0)
-        return opt, decay_groups, extra
+        return Lion(param_groups_std, lr=lr, betas=betas, weight_decay=0.0)
 
     if name_l == "lamb":
-        # Most common: pytorch-lamb repo
-        Lamb = None
+        Lamb = _find_lamb_class()
         try:
-            Lamb = _import_symbol("pytorch_lamb", "Lamb")
-        except Exception:
-            try:
-                Lamb = _import_symbol("pytorch_lamb.lamb", "Lamb")
-            except Exception as e:
-                raise ImportError(
-                    "Could not import Lamb. Install dependency from requirements.txt"
-                ) from e
-        opt = Lamb(param_groups, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
-        return opt, decay_groups, extra
+            return Lamb(param_groups_std, lr=lr, betas=betas, eps=eps, weight_decay=0.0)
+        except TypeError:
+            # filter kwargs by signature for odd implementations
+            sig = inspect.signature(Lamb.__init__)
+            names = set(sig.parameters.keys()) - {"self"}
+            kwargs: Dict[str, Any] = {}
+            if "lr" in names:
+                kwargs["lr"] = lr
+            if "betas" in names:
+                kwargs["betas"] = betas
+            if "eps" in names:
+                kwargs["eps"] = eps
+            if "weight_decay" in names:
+                kwargs["weight_decay"] = 0.0
+            return Lamb(param_groups_std, **kwargs)
 
     if name_l == "sophiag":
-        # local file sophia.py (from Sophia repo)
         SophiaG = _import_symbol("sophia", "SophiaG")
-        opt = SophiaG(param_groups, lr=lr, betas=betas, rho=rho, weight_decay=0.0, eps=eps, interval=interval, variant=variant)
-        # Sophia step uses `bs` (batch size) for scaling hessian estimate
-        extra.update({"sophia_interval": interval})
-        return opt, decay_groups, extra
+        return SophiaG(param_groups_std, lr=lr, betas=betas, rho=rho, weight_decay=0.0)
 
     if name_l == "muon":
-        # Official Muon repo is expected to provide MuonWithAuxAdam
-        MuonWithAuxAdam = None
-        last_err = None
-        for mod, sym in [
-            ("muon", "MuonWithAuxAdam"),
-            ("muon.muon", "MuonWithAuxAdam"),
-        ]:
-            try:
-                MuonWithAuxAdam = _import_symbol(mod, sym)
-                break
-            except Exception as e:
-                last_err = e
-                continue
-        if MuonWithAuxAdam is None:
-            raise ImportError(
-                "Could not import MuonWithAuxAdam from Muon. Install dependency from requirements.txt"
-            ) from last_err
+        # Official Muon: use SingleDeviceMuonWithAuxAdam when not using torch.distributed
+        try:
+            MuonCls = _import_symbol("muon", "SingleDeviceMuonWithAuxAdam")
+        except Exception:
+            MuonCls = _import_symbol("muon", "MuonWithAuxAdam")
 
-        # We pass param_groups directly; Muon implementation decides how to treat matrices.
-        opt = MuonWithAuxAdam(
-            param_groups,
-            lr=lr,
-            momentum=muon_momentum,
-            weight_decay=0.0,
-            betas=betas,
-            eps=eps,
-        )
-        return opt, decay_groups, extra
+        muon_params, aux_params = _muon_param_partition_for_gpt(model)
+
+        # IMPORTANT: group keys must match EXACTLY what muon.py asserts.
+        muon_group = {
+            "params": muon_params,
+            "lr": lr,
+            "momentum": muon_momentum,
+            "weight_decay": 0.0,
+            "use_muon": True,
+        }
+        aux_group = {
+            "params": aux_params,
+            "lr": lr,
+            "betas": betas,
+            "eps": eps,
+            "weight_decay": 0.0,
+            "use_muon": False,
+        }
+        return MuonCls([aux_group, muon_group])
 
     raise ValueError(f"Unknown optimizer name: {name}")

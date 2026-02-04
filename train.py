@@ -34,7 +34,7 @@ from model import GPT, GPTConfig
 from c1bench.dc_diag import DCDiagConfig, DCDiagnostics
 from c1bench.optim_factory import DecayGroups, make_optimizer, split_decay_params
 from c1bench.selector import Selector, SelectorConfig
-from c1bench.utils import JsonlWriter, mkdir_p, now_iso, set_seed, global_grad_norm
+from c1bench.utils import JsonlWriter, mkdir_p, now_iso, set_seed
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,16 +64,13 @@ def load_config(py_file: str) -> Dict[str, Any]:
     with open(py_file, "r", encoding="utf-8") as f:
         code = f.read()
     exec(compile(code, py_file, "exec"), cfg)
-    # remove python internals
     cfg = {k: v for k, v in cfg.items() if not k.startswith("__")}
     return cfg
 
 
 def get_lr(it: int, *, learning_rate: float, warmup_iters: int, lr_decay_iters: int, min_lr: float) -> float:
-    # warmup
     if it < warmup_iters:
         return learning_rate * it / max(1, warmup_iters)
-    # decay
     if it > lr_decay_iters:
         return min_lr
     decay_ratio = (it - warmup_iters) / max(1, (lr_decay_iters - warmup_iters))
@@ -119,7 +116,6 @@ def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 def _apply_decoupled_weight_decay(decay_groups: DecayGroups, weight_decay: float, lr: float) -> None:
     if weight_decay <= 0:
         return
-    # matches AdamW-style decoupled weight decay
     scale = 1.0 - lr * weight_decay
     for p in decay_groups.decay:
         p.mul_(scale)
@@ -129,8 +125,6 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
 
-    # Apply `--set key=value` overrides (repeatable).
-    # Example: --set batch_size=4 --set gradient_accumulation_steps=12
     for kv in args.set:
         if "=" not in kv:
             raise ValueError(f"--set expects key=value, got: {kv!r}")
@@ -143,7 +137,6 @@ def main() -> None:
             v = v_str
         cfg[k] = v
 
-    # -------- config defaults (can be overridden in configs/*.py) --------
     dataset = cfg.get("dataset", "openwebtext")
     data_dir = Path(cfg.get("data_dir", "data/openwebtext"))
 
@@ -201,7 +194,6 @@ def main() -> None:
     diag_tail_samples = int(cfg.get("diag_tail_samples", 80000))
     diag_tau_mult = float(cfg.get("diag_tau_mult", 10.0))
 
-    # misc
     seed = int(args.seed if args.seed is not None else cfg.get("seed", 1337))
     set_seed(seed)
 
@@ -227,7 +219,6 @@ def main() -> None:
     out_dir = mkdir_p(Path(args.out_root) / run_name)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
-    # save resolved config
     resolved = {
         **cfg,
         "resolved": {
@@ -239,14 +230,17 @@ def main() -> None:
             "dtype": dtype_str,
         },
     }
-    (out_dir / "config_resolved.json").write_text(json.dumps(resolved, indent=2), encoding="utf-8")
 
-    # logs
+    (out_dir / "config_resolved.json").write_text(json.dumps(resolved, indent=2), encoding="utf-8")
+    (out_dir / "meta.json").write_text(
+        json.dumps({"config": resolved, "run_name": run_name, "optimizer": optimizer_name, "seed": seed}, indent=2),
+        encoding="utf-8",
+    )
+
     step_log = JsonlWriter(out_dir / "step.jsonl")
     diag_log = JsonlWriter(out_dir / "diag.jsonl") if diag_enabled else None
     sel_log = JsonlWriter(out_dir / "sel.jsonl") if optimizer_name == "selector" else None
 
-    # model
     model_config = GPTConfig(
         block_size=block_size,
         vocab_size=50304,
@@ -261,7 +255,6 @@ def main() -> None:
 
     decay_groups = split_decay_params(model)
 
-    # optimizers
     selector: Optional[Selector] = None
     optim: Optional[torch.optim.Optimizer] = None
     optim_map: Dict[str, torch.optim.Optimizer] = {}
@@ -302,9 +295,6 @@ def main() -> None:
         )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and dtype in (torch.float16,)))
-    autocast = torch.cuda.amp.autocast if device == "cuda" else torch.autocast
-
-    # diagnostics helper
     dc_diag = None
     if diag_enabled:
         dc_diag = DCDiagnostics(
@@ -319,7 +309,6 @@ def main() -> None:
             run_dir=out_dir,
         )
 
-    # resume
     iter_num = 0
     best_val = 1e9
     if args.resume is not None:
@@ -328,24 +317,21 @@ def main() -> None:
         iter_num = int(ckpt.get("iter_num", 0))
         best_val = float(ckpt.get("best_val", 1e9))
         if optimizer_name == "selector":
-            # restore all candidate opt states + selector state
             for name, opt in optim_map.items():
-                if name in ckpt["optimizers"]:
+                if name in ckpt.get("optimizers", {}):
                     opt.load_state_dict(ckpt["optimizers"][name])
-            if selector is not None and "selector" in ckpt:
+            if selector is not None and ckpt.get("selector") is not None:
                 selector.load_state_dict(ckpt["selector"])
         else:
             assert optim is not None
             optim.load_state_dict(ckpt["optimizer"])
-        if "scaler" in ckpt and scaler is not None:
+        if "scaler" in ckpt and ckpt["scaler"] is not None:
             scaler.load_state_dict(ckpt["scaler"])
 
-    # -------- training loop --------
     t0 = time.time()
     for it in range(iter_num, max_iters):
         lr = get_lr(it, learning_rate=learning_rate, warmup_iters=warmup_iters, lr_decay_iters=lr_decay_iters, min_lr=min_lr)
 
-        # forward/backward
         if optimizer_name == "selector":
             for opt in optim_map.values():
                 opt.zero_grad(set_to_none=True)
@@ -354,7 +340,7 @@ def main() -> None:
             optim.zero_grad(set_to_none=True)
 
         lossf = 0.0
-        for micro in range(grad_accum):
+        for _micro in range(grad_accum):
             X, Y = openwebtext_get_batch(data_dir, "train", batch_size, block_size, device)
             with torch.autocast(device_type=device, dtype=dtype, enabled=(dtype != torch.float32)):
                 _, loss = model(X, Y)
@@ -362,7 +348,6 @@ def main() -> None:
             lossf += float(loss.detach())
             scaler.scale(loss).backward() if scaler.is_enabled() else loss.backward()
 
-        # unscale grads (needed if we ever call an optimizer.step() without scaler.step())
         if scaler.is_enabled():
             if selector is not None:
                 scaler.unscale_(selector.active_optimizer)
@@ -370,30 +355,22 @@ def main() -> None:
                 assert optim is not None
                 scaler.unscale_(optim)
 
-        # clip
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        # step
         bs_tokens = batch_size * block_size
 
         if optimizer_name == "selector":
             assert selector is not None
-            # Keep all candidate optimizers in sync with the LR schedule.
-            # Their lr doesn't affect state updates much, but matters once a candidate
-            # becomes active (and it also makes restoring lr after temp lr=0 safe).
             for _opt in selector.optimizers.values():
                 _set_optimizer_lr(_opt, lr)
                 for _g in _opt.param_groups:
                     _g["bs"] = bs_tokens
-            # keep non-active optimizers "on-trajectory" by updating their internal state
-            # with lr=0, BEFORE the active optimizer updates weights.
+
             selector.update_inactive_states_on_trajectory(bs_tokens=bs_tokens)
 
-            # active step
             active_opt = selector.active_optimizer
             _set_optimizer_lr(active_opt, lr)
-            # SophiaG reads bs from the param group (see patched sophia.py)
             for g in active_opt.param_groups:
                 g["bs"] = bs_tokens
 
@@ -413,10 +390,8 @@ def main() -> None:
             else:
                 optim.step()
 
-        # external decoupled weight decay (once per step)
         _apply_decoupled_weight_decay(decay_groups, weight_decay=weight_decay, lr=lr)
 
-        # log
         dt = time.time() - t0
         if it % log_interval == 0:
             rec = {
@@ -429,7 +404,6 @@ def main() -> None:
             step_log.write(rec)
             print(json.dumps(rec))
 
-        # eval + checkpoint
         if it % eval_interval == 0 or it == max_iters - 1:
             losses = estimate_loss(model, data_dir, batch_size, block_size, device, eval_iters)
             val = losses["val"]
@@ -454,11 +428,9 @@ def main() -> None:
                 ckpt["optimizer"] = optim.state_dict() if optim is not None else None
             torch.save(ckpt, ckpt_path)
 
-        # diagnostics
         if dc_diag is not None:
             if optimizer_name == "selector":
                 assert selector is not None
-                # log diagnostics for the *currently active* optimizer for consistency
                 dc_diag.maybe_run(
                     it=it,
                     model=model,
@@ -478,7 +450,6 @@ def main() -> None:
                     bs_tokens=bs_tokens,
                 )
 
-        # selector scoring/switching
         if selector is not None:
             selector.maybe_select(
                 step=it,
@@ -487,7 +458,6 @@ def main() -> None:
                 bs_tokens=bs_tokens,
             )
 
-    # finalize
     if dc_diag is not None:
         dc_diag.finalize()
 
@@ -500,3 +470,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
