@@ -10,19 +10,16 @@ Supported optimizers:
   - selector (DC-based switching)
 
 All runs log to a run directory with JSONL logs + checkpoints.
-
-This script is intentionally *single-process* and mirrors the original
-Sophia code style (nanoGPT-like) to keep it familiar.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
 import time
-import ast
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -172,15 +169,16 @@ def main() -> None:
     eps = float(cfg.get("eps", 1e-8))
     momentum = float(cfg.get("momentum", 0.9))
     rho = float(cfg.get("rho", 0.03))  # SophiaG
+    muon_momentum = float(cfg.get("muon_momentum", 0.95))
 
     # selector config
     selector_candidates = list(cfg.get("selector_candidates", ["sgd", "adamw", "lion", "muon", "sophiag", "lamb"]))
     sel_every = int(cfg.get("sel_every", 100))
-    sel_min_ep = int(cfg.get("sel_min_ep", 100))
-    sel_patience = int(cfg.get("sel_patience", 100))
-    dc_ema_rho = float(cfg.get("dc_ema_rho", 0.2))
-    dc_delta = float(cfg.get("dc_delta", 0.02))
-    dc_min = float(cfg.get("dc_min", 0.0))
+    sel_min_ep = int(cfg.get("sel_min_ep", 200))
+    sel_patience = int(cfg.get("sel_patience", 200))
+    dc_ema_rho = float(cfg.get("dc_ema_rho", 0.5))
+    dc_delta = float(cfg.get("dc_delta", 0.05))
+    dc_min = float(cfg.get("dc_min", 0.004))
 
     # diagnostics config
     diag_enabled = bool(cfg.get("diag", False))
@@ -190,16 +188,23 @@ def main() -> None:
         diag_enabled = False
 
     diag_every = int(cfg.get("diag_every", 100))
-    diag_probes = int(cfg.get("diag_probes", 4))
+    diag_probes = int(cfg.get("diag_probes", 8))
     diag_tail_samples = int(cfg.get("diag_tail_samples", 80000))
     diag_tau_mult = float(cfg.get("diag_tau_mult", 10.0))
+
+    # Optional: path to AdamW tau_ref.json for consistent E-clipping across optimizers/selector.
+    tau_ref_path = cfg.get("tau_ref_path", None)
+    if isinstance(tau_ref_path, str) and tau_ref_path:
+        os.environ.setdefault("DCBENCH_TAU_REF_PATH", tau_ref_path)
 
     seed = int(args.seed if args.seed is not None else cfg.get("seed", 1337))
     set_seed(seed)
 
     device = args.device or cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
-    dtype_str = args.dtype or cfg.get("dtype", "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16")
+    dtype_str = args.dtype or cfg.get(
+        "dtype", "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
+    )
     if dtype_str == "float32":
         dtype = torch.float32
     elif dtype_str == "bfloat16":
@@ -269,6 +274,7 @@ def main() -> None:
                 eps=eps,
                 momentum=momentum,
                 rho=rho,
+                muon_momentum=muon_momentum,
             )
         selector = Selector(
             SelectorConfig(
@@ -279,6 +285,7 @@ def main() -> None:
                 dc_ema_rho=dc_ema_rho,
                 dc_delta=dc_delta,
                 dc_min=dc_min,
+                dc_probes=diag_probes,
             ),
             optims=optim_map,
             log_writer=sel_log,
@@ -292,6 +299,7 @@ def main() -> None:
             eps=eps,
             momentum=momentum,
             rho=rho,
+            muon_momentum=muon_momentum,
         )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and dtype in (torch.float16,)))
@@ -304,6 +312,7 @@ def main() -> None:
                 tail_samples=diag_tail_samples,
                 fp32=True,
                 tau_mult=diag_tau_mult,
+                tau_ref_path=(tau_ref_path if isinstance(tau_ref_path, str) else None),
             ),
             log_writer=diag_log,
             run_dir=out_dir,
@@ -406,12 +415,10 @@ def main() -> None:
 
         if it % eval_interval == 0 or it == max_iters - 1:
             losses = estimate_loss(model, data_dir, batch_size, block_size, device, eval_iters)
-            val = losses["val"]
             rec = {"iter": it, "train_loss": losses["train"], "val_loss": losses["val"]}
             step_log.write({"event": "eval", **rec})
             print(json.dumps({"event": "eval", **rec}))
-            if val < best_val:
-                best_val = val
+            best_val = min(best_val, float(losses["val"]))
 
         if it % save_interval == 0 or it == max_iters - 1:
             ckpt_path = out_dir / "checkpoints" / f"ckpt_iter{it:07d}.pt"
@@ -470,4 +477,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    

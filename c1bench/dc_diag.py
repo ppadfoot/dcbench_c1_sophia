@@ -19,19 +19,21 @@ class DCDiagConfig:
     probes: int = 4
     tail_samples: int = 80000
     fp32: bool = True
-    eps: float = 1e-12
 
-    # tau_ref scheme:
-    # We want tau to be a FIXED reference based on AdamW, not proportional to u_norm of current optimizer.
-    # tau_ref is interpreted as a cap on ||U||, i.e. we cap E_hat by tau_ref^2.
+    # numerical stability
+    eps: float = 1e-12
+    g_floor_abs: float = 1e-6  # floor for G_used
+
+    # tau_ref scheme (AdamW reference)
     tau_mult: float = 10.0
     tau_min: float = 1e-8
-
-    # If True, use tau_ref loaded from env/file; if missing, fallback to dynamic (warn via tau_source field).
     tau_mode: str = "adamw_ref"  # "adamw_ref" | "dynamic"
-    tau_ref_path: Optional[str] = None  # optional; can also come from env DCBENCH_TAU_REF_PATH
-    tau_ref_value: Optional[float] = None  # optional; can also come from env DCBENCH_TAU_REF
-    tau_ref_filename: str = "tau_ref.json"  # stored in run_dir for AdamW runs
+    tau_ref_path: Optional[str] = None  # can also come from env DCBENCH_TAU_REF_PATH
+    tau_ref_value: Optional[float] = None  # can also come from env DCBENCH_TAU_REF
+    tau_ref_filename: str = "tau_ref.json"
+
+    # better tau_ref: median of first N AdamW diag points (reduces noise)
+    tau_ref_n_diags: int = 3
 
 
 def _flatten_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -61,7 +63,7 @@ def _resolve_tau_ref(cfg: DCDiagConfig, run_dir: Optional[Path]) -> Tuple[Option
       2) env DCBENCH_TAU_REF
       3) cfg.tau_ref_path
       4) env DCBENCH_TAU_REF_PATH
-      5) run_dir/tau_ref.json (if exists)
+      5) run_dir/tau_ref.json
     """
     if cfg.tau_ref_value is not None:
         return float(cfg.tau_ref_value), "cfg_value"
@@ -73,9 +75,7 @@ def _resolve_tau_ref(cfg: DCDiagConfig, run_dir: Optional[Path]) -> Tuple[Option
         except Exception:
             pass
 
-    path = cfg.tau_ref_path
-    if not path:
-        path = os.environ.get("DCBENCH_TAU_REF_PATH", "").strip()
+    path = cfg.tau_ref_path or os.environ.get("DCBENCH_TAU_REF_PATH", "").strip()
     if path:
         p = Path(path)
         v = _read_tau_ref_json(p)
@@ -131,8 +131,8 @@ def _adam_like_direction(
     step_new = step + 1
 
     if bias_correction:
-        bc1 = 1.0 - beta1 ** step_new
-        bc2 = 1.0 - beta2 ** step_new
+        bc1 = 1.0 - beta1**step_new
+        bc2 = 1.0 - beta2**step_new
         m_hat = exp_avg_new / max(bc1, 1e-16)
         v_hat = exp_avg_sq_new / max(bc2, 1e-16)
     else:
@@ -176,6 +176,7 @@ def _sophia_direction(
         exp_avg = torch.zeros_like(p, memory_format=torch.preserve_format)
     if hess is None:
         hess = torch.zeros_like(p, memory_format=torch.preserve_format)
+
     exp_avg_new = exp_avg.mul(beta1).add(g, alpha=1.0 - beta1)
     denom = (hess * float(bs)).add(eps)
     u = exp_avg_new / denom
@@ -194,7 +195,6 @@ def direction_for_optimizer(
     name = optimizer_name.lower()
     state = _maybe_get_state(optimizer, p)
 
-    # identity match (avoid Tensor.__contains__)
     group = None
     for gr in optimizer.param_groups:
         for q in gr["params"]:
@@ -209,12 +209,16 @@ def direction_for_optimizer(
     if name == "adamw":
         beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = group.get("eps", 1e-8)
-        return _adam_like_direction(p, g, state, beta1=float(beta1), beta2=float(beta2), eps=float(eps), bias_correction=True, trust_ratio=False)
+        return _adam_like_direction(
+            p, g, state, beta1=float(beta1), beta2=float(beta2), eps=float(eps), bias_correction=True, trust_ratio=False
+        )
 
     if name == "lamb":
         beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = group.get("eps", 1e-6)
-        return _adam_like_direction(p, g, state, beta1=float(beta1), beta2=float(beta2), eps=float(eps), bias_correction=True, trust_ratio=True)
+        return _adam_like_direction(
+            p, g, state, beta1=float(beta1), beta2=float(beta2), eps=float(eps), bias_correction=True, trust_ratio=True
+        )
 
     if name == "sgd":
         mom = float(group.get("momentum", 0.0))
@@ -234,22 +238,21 @@ def direction_for_optimizer(
     if name == "muon":
         use_muon = bool(group.get("use_muon", False))
         if use_muon:
-            # use official muon_update if available
             from muon import muon_update  # official
             beta = float(group.get("momentum", 0.95))
             buf = state.get("momentum_buffer", None)
             if buf is None:
                 buf = torch.zeros_like(p, memory_format=torch.preserve_format)
-
             grad_tmp = g.detach().clone()
             buf_tmp = buf.detach().clone()
             upd = muon_update(grad_tmp, buf_tmp, beta=beta, ns_steps=5, nesterov=True)
             return upd.reshape(p.shape)
 
-        # aux Adam group (use_muon=False)
         betas = group.get("betas", (0.9, 0.95))
         eps = float(group.get("eps", 1e-10))
-        return _adam_like_direction(p, g, state, beta1=float(betas[0]), beta2=float(betas[1]), eps=eps, bias_correction=True, trust_ratio=False)
+        return _adam_like_direction(
+            p, g, state, beta1=float(betas[0]), beta2=float(betas[1]), eps=eps, bias_correction=True, trust_ratio=False
+        )
 
     raise ValueError(f"Unknown optimizer for direction: {optimizer_name}")
 
@@ -266,10 +269,12 @@ def _estimate_dc_core(
     tau_ref: Optional[float],
     tau_source: str,
 ) -> Dict[str, float]:
-    P_acc = 0.0
-    G_acc = 0.0
-    E_acc = 0.0
-    g2_acc = 0.0
+    # We compute per-probe totals to robustify G (heavy tails).
+    P_list: List[float] = []
+    G_list: List[float] = []
+    E_list: List[float] = []
+    g2a_list: List[float] = []
+    g2b_list: List[float] = []
 
     for _k in range(cfg.probes):
         X_a, Y_a = get_batch("train")
@@ -285,73 +290,124 @@ def _estimate_dc_core(
         loss.backward()
         grads_b = [p.grad.detach().clone() if p.grad is not None else None for p in model.parameters()]
 
-        for ga in grads_a:
-            if ga is None:
-                continue
-            g2_acc += float(_flatten_dot(ga.float(), ga.float()).item())
+        Pk = 0.0
+        Gk = 0.0
+        Ek = 0.0
+        g2ak = 0.0
+        g2bk = 0.0
 
         for p, ga, gb in zip(model.parameters(), grads_a, grads_b):
             if ga is None or gb is None:
                 continue
-            ga = ga.to(device)
-            gb = gb.to(device)
-            u = direction_for_optimizer(optimizer_name, optimizer, p, ga, bs=bs_for_sophia)
-            P_acc += float(_flatten_dot(gb.float(), u.float()).item())
-            G_acc += float(_flatten_dot(ga.float(), gb.float()).item())
-            E_acc += float(_flatten_dot(u.float(), u.float()).item())
+
+            # Use float32 reductions for stability
+            ga_f = ga.float()
+            gb_f = gb.float()
+
+            g2ak += float(_flatten_dot(ga_f, ga_f).item())
+            g2bk += float(_flatten_dot(gb_f, gb_f).item())
+            Gk += float(_flatten_dot(ga_f, gb_f).item())
+
+            ga_t = ga.to(device)
+            gb_t = gb.to(device)
+            u = direction_for_optimizer(optimizer_name, optimizer, p, ga_t, bs=bs_for_sophia)
+
+            u_f = u.float()
+            Pk += float(_flatten_dot(gb_t.float(), u_f).item())
+            Ek += float(_flatten_dot(u_f, u_f).item())
+
+        P_list.append(Pk)
+        G_list.append(Gk)
+        E_list.append(Ek)
+        g2a_list.append(g2ak)
+        g2b_list.append(g2bk)
 
     model.zero_grad(set_to_none=True)
 
     K = float(cfg.probes)
-    P_hat = P_acc / K
-    G_hat = G_acc / K
-    E_hat = E_acc / K
-    g2_hat = g2_acc / K
+    P_hat = float(sum(P_list) / K)
+    G_hat = float(sum(G_list) / K)
+    E_hat = float(sum(E_list) / K)
+    g2a_hat = float(sum(g2a_list) / K)
+    g2b_hat = float(sum(g2b_list) / K)
 
     u_norm = math.sqrt(max(E_hat, 0.0))
-    g_norm = math.sqrt(max(g2_hat, 0.0))
+    g_norm = math.sqrt(max(g2a_hat, 0.0))
 
+    # Stable G_used: mean of positive parts across probes
+    G_pos_list = [max(x, 0.0) for x in G_list]
+    G_pos_mean = float(sum(G_pos_list) / K)
+    frac_G_nonpos = float(sum(1 for x in G_list if x <= 0.0) / max(1, len(G_list)))
+
+    if G_pos_mean > cfg.g_floor_abs:
+        G_used = G_pos_mean
+        G_source = "pos_mean"
+    else:
+        G_used = float(cfg.g_floor_abs)
+        G_source = "pos_mean_floor"
+
+    # Positive progress (paper definition uses (P_hat)_+)
     P_pos = max(P_hat, 0.0)
-    G_pos = max(G_hat, 0.0)
 
-    # raw (no clipping)
-    dc_hat_raw = (P_pos ** 2) / (G_pos * max(E_hat, 0.0) + cfg.eps)
-
-    # reference clipping
+    # E clipping using tau_ref
     tau_used = None
-    E_cap = E_hat
+    E_cap = float(E_hat)
     if cfg.tau_mode == "adamw_ref":
         if tau_ref is not None:
             tau_used = max(cfg.tau_min, float(tau_ref))
-            E_cap = min(E_hat, tau_used * tau_used)
+            E_cap = min(E_cap, tau_used * tau_used)
         else:
-            # fallback to dynamic (but record that we couldn't use ref)
             tau_used = max(cfg.tau_min, cfg.tau_mult * u_norm)
             tau_source = "no_ref_fallback_dynamic"
-            E_cap = min(E_hat, tau_used * tau_used)  # still clips (now meaningful vs old)
+            E_cap = min(E_cap, tau_used * tau_used)
     else:
-        # dynamic (but now we actually clip by tau^2 even in dynamic mode)
         tau_used = max(cfg.tau_min, cfg.tau_mult * u_norm)
         tau_source = "dynamic"
-        E_cap = min(E_hat, tau_used * tau_used)
+        E_cap = min(E_cap, tau_used * tau_used)
 
-    dc_hat = (P_pos ** 2) / (G_pos * max(E_cap, 0.0) + cfg.eps)
+    # Core quantities:
+    # - dc_hat_raw: no E clipping
+    # - dc_hat: with E clipping
+    dc_hat_raw_uncapped = (P_pos**2) / (G_used * max(E_hat, 0.0) + cfg.eps)
+    dc_hat_uncapped = (P_pos**2) / (G_used * max(E_cap, 0.0) + cfg.eps)
 
-    c_aln_hat = P_hat / (G_hat + cfg.eps)
-    cos_hat = P_hat / (math.sqrt(max(G_hat, 0.0)) * math.sqrt(max(E_hat, 0.0)) + cfg.eps)
+    # Best-paper: DC is cos^2 proxy => clamp to [0,1]
+    dc_hat_raw = float(max(0.0, min(1.0, dc_hat_raw_uncapped)))
+    dc_hat = float(max(0.0, min(1.0, dc_hat_uncapped)))
+
+    # Also log "certified descent proxy" without G normalization: score = P^2 / E
+    score_hat_raw = float((P_pos**2) / (max(E_hat, 0.0) + cfg.eps))
+    score_hat = float((P_pos**2) / (max(E_cap, 0.0) + cfg.eps))
+
+    # alignment proxies
+    c_aln_hat = float(P_hat / (G_hat + cfg.eps))
+    cos_denom = (math.sqrt(max(G_hat, 0.0)) * math.sqrt(max(E_hat, 0.0)) + cfg.eps)
+    cos_hat = float(P_hat / cos_denom) if cos_denom > 0 else 0.0
+    cos_hat = float(max(-1.0, min(1.0, cos_hat)))
 
     return {
         "P_hat": float(P_hat),
+        "P_pos": float(P_pos),
         "G_hat": float(G_hat),
+        "G_pos_mean": float(G_pos_mean),
+        "G_used": float(G_used),
+        "G_source": str(G_source),
+        "frac_G_nonpos": float(frac_G_nonpos),
         "E_hat": float(E_hat),
         "E_cap": float(E_cap),
+        "g2a_hat": float(g2a_hat),
+        "g2b_hat": float(g2b_hat),
         "g_norm": float(g_norm),
         "u_norm": float(u_norm),
         "tau_used": float(tau_used if tau_used is not None else 0.0),
         "tau_source": str(tau_source),
         "tau_ref": float(tau_ref) if tau_ref is not None else None,
+        "dc_hat_raw_uncapped": float(dc_hat_raw_uncapped),
+        "dc_hat_uncapped": float(dc_hat_uncapped),
         "dc_hat_raw": float(dc_hat_raw),
         "dc_hat": float(dc_hat),
+        "score_hat_raw": float(score_hat_raw),
+        "score_hat": float(score_hat),
         "c_aln_hat": float(c_aln_hat),
         "cos_hat": float(cos_hat),
     }
@@ -418,16 +474,19 @@ def estimate_dc(
             tau_source=tau_source,
         )
 
-    # minimal return for selector
+    # what selector needs + some debugging
     return {
         "dc_hat": float(out["dc_hat"]),
+        "dc_hat_raw": float(out["dc_hat_raw"]),
         "P_hat": float(out["P_hat"]),
         "G_hat": float(out["G_hat"]),
+        "G_used": float(out["G_used"]),
+        "frac_G_nonpos": float(out["frac_G_nonpos"]),
         "E_hat": float(out["E_hat"]),
         "E_cap": float(out["E_cap"]),
-        "dc_hat_raw": float(out["dc_hat_raw"]),
         "tau_used": float(out["tau_used"]),
-        "tau_source": str(out["tau_source"]),
+        "score_hat": float(out["score_hat"]),
+        "score_hat_raw": float(out["score_hat_raw"]),
     }
 
 
@@ -469,9 +528,12 @@ class DCDiagnostics:
         self.run_dir = Path(run_dir)
         self.tail_once = tail_once
         self._tail_saved = False
+
         self._tau_saved = False
+        self._adamw_u_norm_hist: List[float] = []
 
     def _maybe_save_tau_ref_from_adamw(self, *, optimizer_name: str, u_norm: float, step: int) -> None:
+        """Best-paper: compute tau_ref as median of first N diag u_norm values for AdamW."""
         if self.cfg.tau_mode != "adamw_ref":
             return
         if optimizer_name.lower() != "adamw":
@@ -479,9 +541,21 @@ class DCDiagnostics:
         if self._tau_saved:
             return
 
-        tau_ref = max(self.cfg.tau_min, float(self.cfg.tau_mult) * float(u_norm))
+        self._adamw_u_norm_hist.append(float(u_norm))
+        if len(self._adamw_u_norm_hist) < max(1, int(self.cfg.tau_ref_n_diags)):
+            return
+
+        u_med = float(np.median(np.array(self._adamw_u_norm_hist, dtype=np.float64)))
+        tau_ref = max(self.cfg.tau_min, float(self.cfg.tau_mult) * u_med)
+
         p = self.run_dir / self.cfg.tau_ref_filename
-        payload = {"tau_ref": float(tau_ref), "it": int(step), "u_norm": float(u_norm), "note": "tau_ref = tau_mult * u_norm(adamw) @ first diag"}
+        payload = {
+            "tau_ref": float(tau_ref),
+            "it": int(step),
+            "u_norm_median": float(u_med),
+            "u_norm_hist": list(self._adamw_u_norm_hist),
+            "note": f"tau_ref = tau_mult * median(u_norm(adamw) over first {self.cfg.tau_ref_n_diags} diags)",
+        }
         p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self._tau_saved = True
 
@@ -514,7 +588,6 @@ class DCDiagnostics:
             run_dir=self.run_dir,
         )
 
-        # if this is AdamW and we are in ref mode, save tau_ref once
         self._maybe_save_tau_ref_from_adamw(optimizer_name=optimizer_name, u_norm=float(out["u_norm"]), step=it)
 
         if self.tail_once and (not self._tail_saved):
