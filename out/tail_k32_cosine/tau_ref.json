@@ -1,0 +1,11 @@
+{
+  "tau_ref": 29485.323043188546,
+  "it": 200,
+  "u_norm_median": 2948.5323043188546,
+  "u_norm_hist": [
+    8516.04997646249,
+    2948.5323043188546,
+    2190.533647947581
+  ],
+  "note": "tau_ref = tau_mult * median(u_norm(adamw) over first 3 diags)"
+}

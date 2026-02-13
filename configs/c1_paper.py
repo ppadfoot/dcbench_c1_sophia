@@ -32,6 +32,12 @@ learning_rate = 3e-4
 min_lr = 3e-5
 warmup_iters = 200
 lr_decay_iters = 2000
+lr_schedule = "cosine"  # "cosine" | "linear"
+
+# Which optimizer to use by default.
+# You can always override at launch time via:  python train.py ... --optimizer <name>
+optimizer = "sophiag"  # "adamw" | "lion" | "sophiag" | "lamb" | "muon" | "sgd" | "selector"
+
 
 # stability
 grad_clip = 1.0
@@ -81,3 +87,21 @@ sel_dc_ema_rho = 0.1
 sel_dc_margin = 0.05
 sel_dc_min = 0.0
 sel_dc_probes = 4
+
+# --- heavy-tail diagnostics: gradient + gradient-noise tails ---
+# Uses K independent mini-batches to estimate mean grad and noise. See tools/plot_tail_metrics.py
+tail_diag = True
+tail_every = 100
+tail_k_batches = 32
+# number of sampled coordinates per group per diagnostic tick (increase for smoother tails)
+tail_samples_per_group = 200000
+tail_groups = ["all", "decay", "no_decay", "norm", "bias", "embed"]
+tail_save_every = 1  # save arrays every tick; increase to reduce disk
+tail_seed = 1337
+tail_mean_estimator = "mean"  # "mean" | "mom"
+tail_mom_chunks = 8
+tail_fp32 = True
+tail_log_delta = True
+tail_log_delta_signed = False  # set True for alpha-stable "stability under sums" test
+tail_delta_signed_samples = 50000
+tail_grouping_mode = "basic"  # "basic" or "layer_bucket"
