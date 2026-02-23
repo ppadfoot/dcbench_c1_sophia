@@ -1,4 +1,4 @@
-cd """Unified training entrypoint for C1 experiments.
+"""Unified training entrypoint for C1 experiments.
 
 Supported optimizers:
   - sgd
@@ -30,6 +30,7 @@ from model import GPT, GPTConfig
 
 from c1bench.dc_diag import DCDiagConfig, DCDiagnostics
 from c1bench.tail_diag import TailDiagConfig, TailDiagnostics
+from c1bench.sse_diag import SSEDiagConfig, SSEDiagnostics  # <-- NEW
 from c1bench.optim_factory import DecayGroups, make_optimizer, split_decay_params
 from c1bench.selector import Selector, SelectorConfig
 from c1bench.utils import JsonlWriter, mkdir_p, now_iso, set_seed
@@ -60,7 +61,6 @@ def parse_args() -> argparse.Namespace:
         choices=["cosine", "linear"],
         help="Override LR schedule (cosine|linear)",
     )
-
     return p.parse_args()
 
 
@@ -165,16 +165,9 @@ def _apply_decoupled_weight_decay(decay_groups: DecayGroups, weight_decay: float
 # ----------------------------
 
 def _split_top_level_commas(s: str) -> list[str]:
-    """
-    Split a string by commas ONLY at top level (not inside quotes, [], {}, ()).
-    This allows:
-      --set "a=1,b=2"
-      --set "tail_groups=['all','attn_early','mlp_mid']"
-    without breaking on the list commas.
-    """
+    """Split by commas only at top level (not inside quotes/brackets)."""
     out: list[str] = []
     buf: list[str] = []
-
     depth_sq = depth_cu = depth_pa = 0
     in_squote = in_dquote = False
     esc = False
@@ -184,7 +177,6 @@ def _split_top_level_commas(s: str) -> list[str]:
             buf.append(ch)
             esc = False
             continue
-
         if ch == "\\":
             buf.append(ch)
             esc = True
@@ -244,17 +236,9 @@ def _split_top_level_commas(s: str) -> list[str]:
 
 
 def _parse_set_overrides(set_args: list[str]) -> Dict[str, Any]:
-    """
-    Parse args.set (repeatable) into {key: value}.
-
-    - Supports comma-separated `--set a=1,b=2`
-    - Supports lists/dicts/strings with commas inside brackets/quotes:
-        --set tail_groups="['all','attn_early','mlp_mid']"
-    - Parses values with ast.literal_eval when possible, else keeps as string.
-    """
+    """Parse --set overrides, supporting lists/dicts with commas."""
     if not set_args:
         return {}
-
     kv_pairs: list[str] = []
     for raw in set_args:
         raw = str(raw).strip()
@@ -273,7 +257,6 @@ def _parse_set_overrides(set_args: list[str]) -> Dict[str, Any]:
         k = k.strip()
         v_str = v_str.strip()
 
-        # strip outer quotes to allow passing JSON/python literals safely
         if len(v_str) >= 2 and v_str[0] == v_str[-1] and v_str[0] in ("'", '"'):
             v_eval = v_str[1:-1]
         else:
@@ -288,7 +271,6 @@ def _parse_set_overrides(set_args: list[str]) -> Dict[str, Any]:
             elif lv in ("none", "null"):
                 v = None
             else:
-                # try numeric
                 try:
                     v = int(v_eval)
                 except Exception:
@@ -304,7 +286,6 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
 
-    # Robust --set parsing (supports lists with commas)
     overrides = _parse_set_overrides(args.set)
     for k, v in overrides.items():
         cfg[k] = v
@@ -393,6 +374,16 @@ def main() -> None:
     tail_fp32 = bool(cfg.get("tail_fp32", True))
     tail_log_delta = bool(cfg.get("tail_log_delta", True))
 
+    # SSE diagnostics (frequent)
+    sse_enabled = bool(cfg.get("sse_diag", False))
+    sse_every = int(cfg.get("sse_every", 10))
+    sse_samples_per_group = int(cfg.get("sse_samples_per_group", 50000))
+    sse_save_every = int(cfg.get("sse_save_every", sse_every))
+    sse_groups = tuple(cfg.get("sse_groups", ["all", "attn_late", "mlp_late", "norm", "embed"]))
+    sse_grouping_mode = str(cfg.get("sse_grouping_mode", tail_grouping_mode))
+    sse_seed = int(cfg.get("sse_seed", 1337))
+    sse_fp32 = bool(cfg.get("sse_fp32", True))
+
     device = args.device or cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
 
     dtype_str = args.dtype or cfg.get(
@@ -438,6 +429,7 @@ def main() -> None:
     step_log = JsonlWriter(out_dir / "step.jsonl")
     diag_log = JsonlWriter(out_dir / "diag.jsonl") if diag_enabled else None
     tail_log = JsonlWriter(out_dir / "tail.jsonl") if tail_enabled else None
+    sse_log = JsonlWriter(out_dir / "sse.jsonl") if sse_enabled else None
     sel_log = JsonlWriter(out_dir / "sel.jsonl") if optimizer_name == "selector" else None
 
     model_config = GPTConfig(
@@ -497,7 +489,8 @@ def main() -> None:
         )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and dtype in (torch.float16,)))
-    dc_diag = None
+
+    dc_diag: Optional[DCDiagnostics] = None
     if diag_enabled:
         dc_diag = DCDiagnostics(
             cfg=DCDiagConfig(
@@ -512,7 +505,7 @@ def main() -> None:
             run_dir=out_dir,
         )
 
-    tail_diag = None
+    tail_diag: Optional[TailDiagnostics] = None
     if tail_enabled:
         tail_diag_cfg = TailDiagConfig(
             enabled=True,
@@ -529,6 +522,20 @@ def main() -> None:
             log_delta=tail_log_delta,
         )
         tail_diag = TailDiagnostics(tail_diag_cfg, run_dir=out_dir, log_writer=tail_log)
+
+    sse_diag: Optional[SSEDiagnostics] = None
+    if sse_enabled:
+        sse_cfg = SSEDiagConfig(
+            enabled=True,
+            sse_every=sse_every,
+            samples_per_group=sse_samples_per_group,
+            groups=tuple(sse_groups),
+            grouping_mode=sse_grouping_mode,
+            save_every=sse_save_every,
+            seed=sse_seed,
+            fp32=sse_fp32,
+        )
+        sse_diag = SSEDiagnostics(sse_cfg, run_dir=out_dir, log_writer=sse_log)
 
     iter_num = 0
     best_val = 1e9
@@ -566,6 +573,10 @@ def main() -> None:
         else:
             assert optim is not None
             optim.zero_grad(set_to_none=True)
+
+        # For SSE, capture weights before step (only at sse_every)
+        if sse_diag is not None:
+            sse_diag.capture_pre(it=it, model=model, lr=lr, device=device)
 
         lossf = 0.0
         for _micro in range(grad_accum):
@@ -618,6 +629,10 @@ def main() -> None:
             else:
                 optim.step()
 
+        # For SSE, capture after step but BEFORE decoupled WD
+        if sse_diag is not None:
+            sse_diag.capture_post(it=it, model=model, lr=lr, device=device)
+
         _apply_decoupled_weight_decay(decay_groups, weight_decay=weight_decay, lr=lr)
 
         dt = time.time() - t0
@@ -641,18 +656,18 @@ def main() -> None:
 
         if it % save_interval == 0 or it == max_iters - 1:
             ckpt_path = out_dir / "checkpoints" / f"ckpt_iter{it:07d}.pt"
-            ckpt: Dict[str, Any] = {
+            ckpt_out: Dict[str, Any] = {
                 "model": model.state_dict(),
                 "iter_num": it,
                 "best_val": best_val,
                 "scaler": scaler.state_dict() if scaler is not None else None,
             }
             if optimizer_name == "selector":
-                ckpt["optimizers"] = {name: opt.state_dict() for name, opt in optim_map.items()}
-                ckpt["selector"] = selector.state_dict() if selector is not None else None
+                ckpt_out["optimizers"] = {name: opt.state_dict() for name, opt in optim_map.items()}
+                ckpt_out["selector"] = selector.state_dict() if selector is not None else None
             else:
-                ckpt["optimizer"] = optim.state_dict() if optim is not None else None
-            torch.save(ckpt, ckpt_path)
+                ckpt_out["optimizer"] = optim.state_dict() if optim is not None else None
+            torch.save(ckpt_out, ckpt_path)
 
         if dc_diag is not None:
             if optimizer_name == "selector":
@@ -699,6 +714,8 @@ def main() -> None:
         diag_log.close()
     if tail_log is not None:
         tail_log.close()
+    if sse_log is not None:
+        sse_log.close()
     if sel_log is not None:
         sel_log.close()
 

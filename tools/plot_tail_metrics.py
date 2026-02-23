@@ -1,884 +1,578 @@
 #!/usr/bin/env python3
-"""tools/plot_tail_metrics.py
+# -*- coding: utf-8 -*-
 
-Plot heavy-tail diagnostics logged by :class:`c1bench.tail_diag.TailDiagnostics`.
+"""
+tools/plot_tail_metrics.py  (paper-ready labels)
 
-What this script does
----------------------
-Given a run directory that contains ``tails/tails_iterXXXXXXX.npz`` files, this script:
+What changed vs previous versions:
+- Titles are short and clean.
+- All fit stats (alpha, R^2, lambda) and mask params are shown in small annotation boxes.
+- Underscores in group/series names are replaced for readability in titles.
+- CCDF panel overlays fitted curves and shows a compact legend.
+- B_eff computed tail-only + trimmed edges (avoids the “tooth” near mask boundary).
 
-1) Makes *individual* PDFs for each (group × series × plot-kind).
-2) Also makes a *single bundled PDF* per iteration that contains all plots.
-3) Optionally estimates tail exponents using two standard approaches:
-   - Clauset-style continuous Pareto fit (KS-min over candidate xmin)
-   - Hill plot (top-k estimator) for sanity/robustness
+Supports series keys:
+- grad, noise, delta, mean -> grad_abs__G, noise_abs__G, delta_abs__G, mean_abs__G
+- step, step_noise, step_delta, step_mean -> step_abs__G, step_noise_abs__G, step_delta_abs__G, step_mean_abs__G
 
-Important conventions
----------------------
-We work with positive variables, typically absolute values:
-  - |g|         (one-batch gradient sample)
-  - |noise|     where noise = g - mean(g over K batches)
-  - |delta|     where delta = g_a - g_b (two independent batches; simple noise proxy)
+Outputs:
+- <run_dir>/figures_tail/tail_tails_iterXXXXXXX__ALL_PLOTS.pdf (bundle)
+- <run_dir>/figures_tail/tail_iterXXXXXXX__<series>__<group>.pdf (single pages)
+- <run_dir>/figures_tail/PAPER_tail_iterXXXXXXX__<series>.pdf (paper mode)
 
-If the *tail* is Pareto:
-  CCDF:   P(X > x) ~ x^{-B}
-  PDF:    p(x)     ~ x^{-(B+1)}
-
-So:
-  - B is the slope magnitude on a log–log CCDF plot.
-  - B_eff(x) is a *local* slope estimate of the log–log CCDF.
-
-Why B_eff is noisy
-------------------
-B_eff involves a numerical derivative of log(CCDF). Derivatives amplify noise.
-We therefore compute B_eff using a sliding-window linear regression in log–log space
-(``--beff_window``). Increasing the window smooths B_eff.
-
-Typical usage
--------------
-
-Plot the latest diagnostics (and bundle them):
-
-  python tools/plot_tail_metrics.py --run_dir out/tail_k32_cosine
-
-Plot specific iterations:
-
-  python tools/plot_tail_metrics.py --run_dir out/tail_k32_cosine \
-    --mode iters --iters 200,400,800,1200,1600,1900
-
-Make an "alpha over time" summary (requires multiple iterations selected):
-
-  python tools/plot_tail_metrics.py --run_dir out/tail_k32_cosine --mode all --over_time
+Example (paper mode):
+  RUN=E4_layer_bucket_v2
+  python tools/plot_tail_metrics.py --run_dir out/$RUN --mode iters --iters 1800 \
+    --paper --paper_groups all,attn_late,mlp_late --series delta
 """
 
-from __future__ import annotations
-
 import argparse
-import json
-import math
+import glob
+import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# -------------------------
+# Helpers
+# -------------------------
 
+def natural_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
-def _clean_pos(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x)
+def parse_iter(npz_path: str) -> int:
+    base = os.path.basename(npz_path)
+    m = re.search(r"iter(\d+)\.npz", base)
+    return int(m.group(1)) if m else -1
+
+def list_npz(run_dir: str, npz_glob: str) -> List[str]:
+    patt = os.path.join(run_dir, "tails", npz_glob)
+    files = sorted(glob.glob(patt), key=natural_key)
+    if not files:
+        raise FileNotFoundError(f"No files matching {npz_glob!r} found in {run_dir}/tails")
+    return files
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def safe_positive(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
     x = x[np.isfinite(x)]
     x = x[x > 0]
     return x
 
+def pretty_name(s: str) -> str:
+    # make labels less “underscore-y” for paper
+    return s.replace("_", "-")
 
-def _geomean(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return np.sqrt(a * b)
+def fmt_float(x: float, nd: int = 3) -> str:
+    if x is None or not np.isfinite(x):
+        return "n/a"
+    return f"{x:.{nd}g}"
 
+def fmt_lambda(lam: float) -> str:
+    if lam is None or not np.isfinite(lam):
+        return "n/a"
+    if np.isinf(lam):
+        return "∞"
+    return f"{lam:.3g}"
 
-def _safe_log(x: np.ndarray) -> np.ndarray:
-    return np.log(np.clip(x, 1e-300, None))
+# -------------------------
+# Mapping from series name to npz key prefix
+# -------------------------
 
+SERIES_TO_PREFIX = {
+    "grad": "grad_abs",
+    "noise": "noise_abs",
+    "delta": "delta_abs",
+    "mean": "mean_abs",
+    "step": "step_abs",
+    "step_noise": "step_noise_abs",
+    "step_delta": "step_delta_abs",
+    "step_mean": "step_mean_abs",
+}
 
-def _extract_iter(path: Path) -> int:
-    m = re.search(r"tails_iter(\d+)\.npz$", path.name)
-    return int(m.group(1)) if m else -1
+# -------------------------
+# CCDF / grid / fits
+# -------------------------
 
+def ccdf_on_grid(x_sorted: np.ndarray, x_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    n = x_sorted.size
+    idx = np.searchsorted(x_sorted, x_grid, side="right")
+    ccdf = (n - idx) / n
+    ccdf = np.clip(ccdf, 1.0 / (n + 1.0), 1.0)
+    tail_count = n * ccdf
+    return ccdf, tail_count
 
-def _list_tail_npz_files(tails_dir: Path) -> List[Path]:
-    return sorted(tails_dir.glob("tails_iter*.npz"))
+def make_grid_logspace(x: np.ndarray, grid_points: int) -> np.ndarray:
+    x = safe_positive(x)
+    lo = max(np.quantile(x, 0.001), x.min())
+    hi = max(np.quantile(x, 0.99999), lo * 1.001)
+    return np.logspace(np.log10(lo), np.log10(hi), grid_points)
 
+def make_grid_quantile(x_sorted: np.ndarray, grid_points: int) -> np.ndarray:
+    ps = np.linspace(0.001, 0.99999, grid_points)
+    xg = np.quantile(x_sorted, ps)
+    xg = np.unique(xg)
+    if xg.size < 2:
+        lo = max(np.quantile(x_sorted, 0.001), x_sorted.min())
+        hi = max(np.quantile(x_sorted, 0.99999), lo * 1.001)
+        xg = np.logspace(np.log10(lo), np.log10(hi), grid_points)
+    return xg
 
-def _pick_files(files: Sequence[Path], *, mode: str, iters: Sequence[int]) -> List[Path]:
-    if mode == "latest":
-        return [max(files, key=_extract_iter)] if files else []
-    if mode == "all":
-        return list(files)
-    if mode == "iters":
-        want = set(int(x) for x in iters)
-        return [f for f in files if _extract_iter(f) in want]
-    raise ValueError(f"Unknown mode: {mode}")
+def fit_powerlaw_logccdf(logx: np.ndarray, logccdf: np.ndarray) -> Tuple[float, float, float]:
+    if logx.size < 20:
+        return float("nan"), float("nan"), float("nan")
+    b, a = np.polyfit(logx, logccdf, 1)  # logccdf = a + b*logx
+    yhat = a + b * logx
+    ss_res = np.sum((logccdf - yhat) ** 2)
+    ss_tot = np.sum((logccdf - logccdf.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    alpha = -b
+    return float(alpha), float(a), float(r2)
 
+def fit_tempered_logccdf(logx: np.ndarray, x: np.ndarray, logccdf: np.ndarray) -> Tuple[float, float, float, float, float]:
+    if logx.size < 20:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+    A = np.stack([np.ones_like(logx), logx, x], axis=1)
+    coef, *_ = np.linalg.lstsq(A, logccdf, rcond=None)
+    c0, b1, b2 = coef
+    yhat = A @ coef
+    ss_res = np.sum((logccdf - yhat) ** 2)
+    ss_tot = np.sum((logccdf - logccdf.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    alpha = -b1
+    lam = float("inf")
+    if b2 < 0:
+        lam = float(-1.0 / b2)
+    return float(alpha), lam, float(c0), float(b2), float(r2)
 
-def _available_groups(npz: Dict[str, np.ndarray]) -> List[str]:
-    groups = []
-    for k in npz.keys():
-        if k.startswith("grad_abs__"):
-            groups.append(k.split("__", 1)[1])
-    return sorted(set(groups))
+# -------------------------
+# B_eff (tail-only + trim)
+# -------------------------
 
+def local_slope_ls(logx: np.ndarray, logy: np.ndarray, window: int) -> np.ndarray:
+    n = logx.size
+    w = max(1, window // 2)
+    slopes = np.full(n, np.nan, dtype=np.float64)
+    for i in range(n):
+        j0 = max(0, i - w)
+        j1 = min(n, i + w + 1)
+        X = logx[j0:j1]
+        Y = logy[j0:j1]
+        if X.size < 2:
+            continue
+        Xc = X - X.mean()
+        denom = np.sum(Xc * Xc)
+        if denom <= 0:
+            continue
+        slopes[i] = np.sum(Xc * (Y - Y.mean())) / denom
+    return slopes
 
-def _available_series_for_group(npz: Dict[str, np.ndarray], group: str) -> List[str]:
-    series = []
-    for s in ["grad", "noise", "delta", "mean"]:
-        key = f"{s}_abs__{group}"
-        if key in npz:
-            series.append(s)
-    return series
+@dataclass
+class TailView:
+    x: np.ndarray
+    ccdf: np.ndarray
+    tail_count: np.ndarray
+    n: int
 
+def compute_tail_view(x: np.ndarray, grid_mode: str, grid_points: int) -> TailView:
+    x = safe_positive(x)
+    x_sorted = np.sort(x)
+    if grid_mode == "quantile":
+        x_grid = make_grid_quantile(x_sorted, grid_points)
+    else:
+        x_grid = make_grid_logspace(x, grid_points)
+    ccdf, tail_count = ccdf_on_grid(x_sorted, x_grid)
+    return TailView(x=x_grid, ccdf=ccdf, tail_count=tail_count, n=x_sorted.size)
 
-# -----------------------------
-# Core plotting primitives
-# -----------------------------
+def tail_mask(view: TailView, min_tail_count: int, ccdf_max: float) -> np.ndarray:
+    return (
+        np.isfinite(view.ccdf)
+        & (view.ccdf > 0)
+        & (view.tail_count >= min_tail_count)
+        & (view.ccdf <= ccdf_max)
+        & (view.x > 0)
+    )
 
+def compute_beff_tail_only(view: TailView, mask: np.ndarray, window: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
+    idx = np.where(mask)[0]
+    # need enough points for stable slope
+    if idx.size < max(40, window + 10):
+        return None, None, None
 
-def log_hist_density(x: np.ndarray, *, bins: int = 80) -> Tuple[np.ndarray, np.ndarray]:
-    """Log-binned histogram density estimate for positive x."""
-    x = _clean_pos(x)
-    if x.size < 20:
+    x_tail = view.x[idx]
+    ccdf_tail = view.ccdf[idx]
+    logx = np.log(x_tail)
+    logy = np.log(np.clip(ccdf_tail, 1e-300, 1.0))
+
+    slopes = local_slope_ls(logx, logy, window=window)
+    beff = -slopes
+
+    # trim edges to avoid boundary artifacts (the "tooth")
+    t = window // 2
+    if idx.size <= 2 * t + 20:
+        t = max(0, (idx.size - 20) // 2)
+    if t > 0:
+        x_tail = x_tail[t:-t]
+        beff = beff[t:-t]
+
+    m = np.isfinite(beff)
+    x_tail = x_tail[m]
+    beff = beff[m]
+    if x_tail.size < 10:
+        return None, None, None
+
+    med = float(np.median(beff))
+    return x_tail, beff, med
+
+# -------------------------
+# Density (kept for bundle/appendix)
+# -------------------------
+
+def density_log_binned(x: np.ndarray, nbins: int) -> Tuple[np.ndarray, np.ndarray]:
+    x = safe_positive(x)
+    if x.size < 2:
         return np.array([]), np.array([])
-    xmin, xmax = float(np.min(x)), float(np.max(x))
-    if not (xmax > xmin > 0):
-        return np.array([]), np.array([])
-    edges = np.logspace(np.log10(xmin), np.log10(xmax), bins + 1)
-    counts, edges = np.histogram(x, bins=edges)
+    lo = max(np.quantile(x, 0.001), x.min())
+    hi = max(np.quantile(x, 0.99999), lo * 1.001)
+    edges = np.logspace(np.log10(lo), np.log10(hi), nbins + 1)
+    counts, _ = np.histogram(x, bins=edges)
     widths = edges[1:] - edges[:-1]
-    centers = _geomean(edges[1:], edges[:-1])
-    dens = counts.astype(np.float64) / (x.size * widths)
+    centers = np.sqrt(edges[:-1] * edges[1:])
+    dens = counts / (x.size * widths)
     m = dens > 0
     return centers[m], dens[m]
 
+# -------------------------
+# Plot formatting helpers
+# -------------------------
 
-def ccdf_on_log_grid(x: np.ndarray, *, bins: int = 400) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute CCDF on a log-spaced x-grid."""
-    x = _clean_pos(x)
-    if x.size < 20:
-        return np.array([]), np.array([])
-    xs = np.sort(x)
-    n = xs.size
-    xmin, xmax = float(xs[0]), float(xs[-1])
-    if not (xmax > xmin > 0):
-        return np.array([]), np.array([])
-    grid = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-    idx = np.searchsorted(xs, grid, side="right")
-    ccdf = (n - idx).astype(np.float64) / float(n)
-    m = (ccdf > 0) & np.isfinite(ccdf)
-    return grid[m], ccdf[m]
+def add_box(ax, text: str, loc: str = "tr"):
+    # loc: "tr" top-right, "tl", "br", "bl"
+    x = 0.98 if "r" in loc else 0.02
+    y = 0.98 if "t" in loc else 0.02
+    ha = "right" if "r" in loc else "left"
+    va = "top" if "t" in loc else "bottom"
+    ax.text(
+        x, y, text, transform=ax.transAxes, ha=ha, va=va,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.85),
+        fontsize=10,
+    )
 
+def plot_ccdf_with_fits(ax, view: TailView, x_fit: np.ndarray,
+                        alpha_pw: float, a_pw: float, r2_pw: float,
+                        alpha_tp: float, lam_tp: float, c0_tp: float, b2_tp: float, r2_tp: float):
+    ax.plot(view.x, view.ccdf, linewidth=2, label="CCDF")
 
-def beff_from_ccdf_window_reg(
+    # overlay fits only on x_fit
+    if x_fit is not None and x_fit.size > 0:
+        if np.isfinite(alpha_pw) and np.isfinite(a_pw):
+            logx = np.log(x_fit)
+            logcc = a_pw + (-alpha_pw) * logx
+            ax.plot(x_fit, np.exp(logcc), linewidth=2, label="Power-law fit")
+        if np.isfinite(alpha_tp) and np.isfinite(c0_tp) and np.isfinite(b2_tp):
+            logx = np.log(x_fit)
+            logcc = c0_tp + (-alpha_tp) * logx + b2_tp * x_fit
+            ax.plot(x_fit, np.exp(logcc), linewidth=2, label="Tempered fit")
+        # x_min line
+        ax.axvline(float(x_fit.min()), linestyle="--", linewidth=1.0, color="gray")
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("x (log)")
+    ax.set_ylabel("CCDF (log)")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="best", fontsize=10)
+
+    box = (
+        f"Power-law:  alpha={fmt_float(alpha_pw)}  R²={fmt_float(r2_pw,3)}\n"
+        f"Tempered:   alpha={fmt_float(alpha_tp)}  lambda={fmt_lambda(lam_tp)}  R²={fmt_float(r2_tp,3)}\n"
+        f"x_min={fmt_float(float(x_fit.min()) if x_fit is not None and x_fit.size>0 else np.nan)}"
+    )
+    add_box(ax, box, loc="tr")
+
+def plot_beff(ax, x_tail: np.ndarray, beff: np.ndarray, med: float,
+              min_tail_count: int, ccdf_max: float, window: int):
+    ax.plot(x_tail, beff, linewidth=2, label=r"$B_{\mathrm{eff}}(x)$")
+    ax.axhline(med, linestyle="--", linewidth=1.2, label=f"median={med:.3g}")
+
+    ax.set_xscale("log")
+    ax.set_xlabel("x (log)")
+    ax.set_ylabel(r"$B_{\mathrm{eff}}$")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.legend(loc="best", fontsize=10)
+
+    box = f"mask: n·CCDF ≥ {min_tail_count}, CCDF ≤ {ccdf_max}\nwindow={window} (tail-only, trimmed)"
+    add_box(ax, box, loc="tr")
+
+# -------------------------
+# Page builders
+# -------------------------
+
+def plot_triplet_page(
+    pdf: PdfPages,
+    single_path: str,
+    it: int,
+    group: str,
+    series: str,
     x: np.ndarray,
-    ccdf: np.ndarray,
-    *,
-    window: int = 21,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute B_eff(x) via sliding-window linear regression in log–log space.
+    grid_mode: str,
+    grid_points: int,
+    density_bins: int,
+    beff_window: int,
+    min_tail_count: int,
+    ccdf_max: float,
+):
+    x = safe_positive(x)
+    if x.size < 500:
+        return
 
-    Returns (x_mid, B_eff).
-    """
-    if x.size < 10:
-        return np.array([]), np.array([])
-    lx = _safe_log(x)
-    ly = _safe_log(ccdf)
-    n = lx.size
-    w = int(max(5, window))
-    if w % 2 == 0:
-        w += 1
-    half = w // 2
-    if n <= w:
-        # fall back to simple diff
-        dx = np.diff(lx)
-        dy = np.diff(ly)
-        m = dx != 0
-        beff = -(dy[m] / dx[m])
-        xmid = np.exp(0.5 * (lx[1:][m] + lx[:-1][m]))
-        return xmid, beff
+    view = compute_tail_view(x, grid_mode=grid_mode, grid_points=grid_points)
+    m = tail_mask(view, min_tail_count=min_tail_count, ccdf_max=ccdf_max)
+    x_tail, beff_tail, med = compute_beff_tail_only(view, m, window=beff_window)
 
-    out_x: List[float] = []
-    out_b: List[float] = []
-    for i in range(half, n - half):
-        xx = lx[i - half : i + half + 1]
-        yy = ly[i - half : i + half + 1]
-        # y = a + b x
-        b, a = np.polyfit(xx, yy, deg=1)
-        out_x.append(float(np.exp(lx[i])))
-        out_b.append(float(-b))
-    return np.asarray(out_x), np.asarray(out_b)
+    # fit on SAME tail-only points
+    alpha_pw = a_pw = r2_pw = float("nan")
+    alpha_tp = lam_tp = c0_tp = b2_tp = r2_tp = float("nan")
+    x_fit = np.array([])
 
+    if x_tail is not None and x_tail.size >= 30:
+        x_fit = x_tail
+        idx = np.searchsorted(view.x, x_fit)
+        idx = np.clip(idx, 0, view.x.size - 1)
+        ccdf_fit = view.ccdf[idx]
+        logx = np.log(x_fit)
+        logcc = np.log(np.clip(ccdf_fit, 1e-300, 1.0))
+        alpha_pw, a_pw, r2_pw = fit_powerlaw_logccdf(logx, logcc)
+        alpha_tp, lam_tp, c0_tp, b2_tp, r2_tp = fit_tempered_logccdf(logx, x_fit, logcc)
 
-# -----------------------------
-# Tail exponent estimation
-# -----------------------------
+    dx, dy = density_log_binned(x, nbins=density_bins)
 
+    fig = plt.figure(figsize=(8.2, 10.5))
+    fig.suptitle(f"iter={it}   series={pretty_name(series)}   group={pretty_name(group)}", y=0.995, fontsize=14)
 
-@dataclass
-class ParetoFit:
-    xmin: float
-    a_pdf: float  # PDF exponent: p(x) ~ x^{-a_pdf}
-    B_ccdf: float  # CCDF exponent: P(X>x) ~ x^{-B_ccdf}  (B_ccdf = a_pdf - 1)
-    ks: float
-    n_tail: int
-    se_B: float
+    ax1 = fig.add_subplot(3, 1, 1)
+    if dx.size > 0:
+        ax1.plot(dx, dy, linewidth=2)
+    ax1.set_xscale("log")
+    ax1.set_yscale("log")
+    ax1.set_xlabel("x (log)")
+    ax1.set_ylabel("density (log)")
+    ax1.set_title("Density (log-binned)", fontsize=12)
+    ax1.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.5)
 
+    ax2 = fig.add_subplot(3, 1, 2)
+    ax2.set_title("CCDF (log–log) + fits", fontsize=12)
+    plot_ccdf_with_fits(ax2, view, x_fit,
+                        alpha_pw, a_pw, r2_pw,
+                        alpha_tp, lam_tp, c0_tp, b2_tp, r2_tp)
 
-def clauset_pareto_fit(
-    x: np.ndarray,
-    *,
-    xmin_q_lo: float = 0.90,
-    xmin_q_hi: float = 0.995,
-    xmin_grid: int = 50,
-    min_tail: int = 1000,
-) -> Optional[ParetoFit]:
-    """Clauset-style continuous Pareto fit.
+    ax3 = fig.add_subplot(3, 1, 3)
+    ax3.set_title(r"$B_{\mathrm{eff}}(x)$ on tail (stable view)", fontsize=12)
+    if x_tail is not None and beff_tail is not None:
+        plot_beff(ax3, x_tail, beff_tail, med, min_tail_count, ccdf_max, beff_window)
+    else:
+        add_box(ax3, "No stable tail after mask.\nTry smaller min_tail_count or larger samples.", loc="tl")
+        ax3.set_xscale("log")
+        ax3.set_xlabel("x (log)")
+        ax3.set_ylabel(r"$B_{\mathrm{eff}}$")
+        ax3.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.5)
 
-    We scan candidate xmin values (quantile grid) and pick the xmin that minimizes KS distance.
-    Uses continuous Pareto MLE for the PDF exponent:
-        a = 1 + n / sum log(x_i/xmin)
-    Then CCDF exponent is B = a - 1.
-
-    Returns None if we cannot fit stably (too few points, degenerate data, etc.).
-    """
-    x = _clean_pos(x)
-    if x.size < max(100, min_tail):
-        return None
-
-    # Candidate xmins from quantiles (unique, sorted)
-    q_lo = float(np.clip(xmin_q_lo, 0.0, 1.0))
-    q_hi = float(np.clip(xmin_q_hi, q_lo + 1e-6, 1.0))
-    qs = np.linspace(q_lo, q_hi, int(max(5, xmin_grid)))
-    xmins = np.unique(np.quantile(x, qs))
-    xmins = xmins[np.isfinite(xmins)]
-    xmins = xmins[xmins > 0]
-    if xmins.size == 0:
-        return None
-
-    best: Optional[ParetoFit] = None
-
-    x_sorted = np.sort(x)
-    n_total = x_sorted.size
-
-    for xmin in xmins:
-        # tail selection
-        start = int(np.searchsorted(x_sorted, xmin, side="left"))
-        tail = x_sorted[start:]
-        n = tail.size
-        if n < min_tail:
-            continue
-        if not np.all(tail >= xmin):
-            continue
-
-        # MLE for PDF exponent
-        logs = np.log(tail / float(xmin))
-        s = float(np.sum(logs))
-        if not np.isfinite(s) or s <= 0:
-            continue
-        a_pdf = 1.0 + n / s
-        B = a_pdf - 1.0
-        if not (np.isfinite(a_pdf) and a_pdf > 1.0 and np.isfinite(B) and B > 0):
-            continue
-
-        # KS distance on tail (continuous Pareto CDF)
-        # model CDF: F(x)=1-(x/xmin)^{-B}
-        emp_cdf = (np.arange(1, n + 1) / float(n)).astype(np.float64)
-        model_cdf = 1.0 - (tail / float(xmin)) ** (-B)
-        ks = float(np.max(np.abs(emp_cdf - model_cdf)))
-        if not np.isfinite(ks):
-            continue
-
-        se_B = float(B / math.sqrt(n))
-
-        fit = ParetoFit(xmin=float(xmin), a_pdf=float(a_pdf), B_ccdf=float(B), ks=float(ks), n_tail=int(n), se_B=se_B)
-        if (best is None) or (fit.ks < best.ks):
-            best = fit
-
-    return best
-
-
-def hill_alpha(x: np.ndarray, k: int) -> Optional[float]:
-    """Hill estimator for CCDF exponent (tail index) on positive samples.
-
-    For Pareto tail with CCDF exponent B, Hill estimates B.
-    """
-    x = _clean_pos(x)
-    n = x.size
-    k = int(k)
-    if n < 50 or k <= 5 or k >= n:
-        return None
-    xs = np.sort(x)[::-1]  # descending
-    xk1 = xs[k]
-    if not (np.isfinite(xk1) and xk1 > 0):
-        return None
-    top = xs[:k]
-    logs = np.log(np.clip(top / xk1, 1e-300, None))
-    m = float(np.mean(logs))
-    if not (np.isfinite(m) and m > 0):
-        return None
-    return float(1.0 / m)
-
-
-def hill_curve(x: np.ndarray, *, k_min: int = 50, k_max: int = 5000, n_points: int = 80) -> Tuple[np.ndarray, np.ndarray]:
-    x = _clean_pos(x)
-    n = x.size
-    if n < 200:
-        return np.array([]), np.array([])
-    k_max = int(min(k_max, n - 1))
-    k_min = int(max(10, k_min))
-    if k_max <= k_min + 5:
-        return np.array([]), np.array([])
-    ks = np.unique(np.round(np.logspace(np.log10(k_min), np.log10(k_max), n_points)).astype(int))
-    alphas = []
-    ks2 = []
-    for k in ks:
-        a = hill_alpha(x, int(k))
-        if a is None:
-            continue
-        ks2.append(int(k))
-        alphas.append(float(a))
-    if not ks2:
-        return np.array([]), np.array([])
-    return np.asarray(ks2), np.asarray(alphas)
-
-
-@dataclass
-class CCDFLinearFit:
-    B: float
-    intercept: float
-    r2: float
-
-
-@dataclass
-class CCDTemperedFit:
-    B: float
-    lam: float
-    intercept: float
-    r2: float
-
-
-def _linfit(y: np.ndarray, X: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Return (beta, r2)."""
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    yhat = X @ beta
-    ss_res = float(np.sum((y - yhat) ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-    return beta, float(r2)
-
-
-def fit_ccdf_powerlaw(grid: np.ndarray, ccdf: np.ndarray, *, xmin: float) -> Optional[CCDFLinearFit]:
-    m = (grid >= float(xmin)) & np.isfinite(ccdf) & (ccdf > 0)
-    if np.sum(m) < 10:
-        return None
-    x = grid[m]
-    y = np.log(ccdf[m])
-    lx = np.log(x)
-    # y = c - B log x
-    X = np.stack([np.ones_like(lx), -lx], axis=1)
-    beta, r2 = _linfit(y, X)
-    c, B = float(beta[0]), float(beta[1])
-    if not (np.isfinite(B) and B > 0):
-        return None
-    return CCDFLinearFit(B=B, intercept=c, r2=r2)
-
-
-def fit_ccdf_tempered(grid: np.ndarray, ccdf: np.ndarray, *, xmin: float) -> Optional[CCDTemperedFit]:
-    m = (grid >= float(xmin)) & np.isfinite(ccdf) & (ccdf > 0)
-    if np.sum(m) < 20:
-        return None
-    x = grid[m]
-    y = np.log(ccdf[m])
-    lx = np.log(x)
-    # y = c - B log x - lam x
-    X = np.stack([np.ones_like(lx), -lx, -x], axis=1)
-    beta, r2 = _linfit(y, X)
-    c, B, lam = float(beta[0]), float(beta[1]), float(beta[2])
-    if not (np.isfinite(B) and B > 0 and np.isfinite(lam) and lam >= 0):
-        return None
-    return CCDTemperedFit(B=B, lam=lam, intercept=c, r2=r2)
-
-
-# -----------------------------
-# Figure helpers
-# -----------------------------
-
-
-def _save(fig: plt.Figure, path: Path, *, bundle: Optional[PdfPages]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, bbox_inches="tight")
-    if bundle is not None:
-        bundle.savefig(fig)
+    fig.savefig(single_path, bbox_inches="tight")
+    pdf.savefig(fig, bbox_inches="tight")
     plt.close(fig)
 
+def plot_paper_pdf(
+    out_dir: str,
+    npz_path: str,
+    it: int,
+    groups: List[str],
+    series: str,
+    grid_mode: str,
+    grid_points: int,
+    beff_window: int,
+    min_tail_count: int,
+    ccdf_max: float,
+):
+    ensure_dir(out_dir)
+    prefix = SERIES_TO_PREFIX[series]
 
-def _fig_text_page(title: str, lines: Sequence[str]) -> plt.Figure:
-    fig = plt.figure(figsize=(11, 8.5))
-    fig.suptitle(title, fontsize=14)
-    txt = "\n".join(lines)
-    # NOTE: avoid emoji on purpose (many PDF fonts do not contain those glyphs).
-    fig.text(0.03, 0.95, txt, va="top", family="DejaVu Sans Mono")
-    return fig
+    paper_path = os.path.join(out_dir, f"PAPER_tail_iter{it:07d}__{series}.pdf")
+    with np.load(npz_path) as z, PdfPages(paper_path) as pdf:
+        for grp in groups:
+            key = f"{prefix}__{grp}"
+            if key not in z:
+                continue
+            x = safe_positive(z[key])
+            if x.size < 500:
+                continue
 
+            view = compute_tail_view(x, grid_mode=grid_mode, grid_points=grid_points)
+            m = tail_mask(view, min_tail_count=min_tail_count, ccdf_max=ccdf_max)
+            x_tail, beff_tail, med = compute_beff_tail_only(view, m, window=beff_window)
 
-def _fig_checklist_table_page(
-    *,
-    title: str,
-    meta_lines: Sequence[str],
-    rows: Sequence[Dict[str, str]],
-) -> plt.Figure:
-    """A one-page summary with a colored checklist table.
+            alpha_pw = a_pw = r2_pw = float("nan")
+            alpha_tp = lam_tp = c0_tp = b2_tp = r2_tp = float("nan")
+            x_fit = np.array([])
 
-    Each row is expected to have keys: group, series, status, B, xmin, ks, r2, note.
-    """
-    fig = plt.figure(figsize=(11, 8.5))
-    fig.suptitle(title, fontsize=14)
+            if x_tail is not None and x_tail.size >= 30:
+                x_fit = x_tail
+                idx = np.searchsorted(view.x, x_fit)
+                idx = np.clip(idx, 0, view.x.size - 1)
+                ccdf_fit = view.ccdf[idx]
+                logx = np.log(x_fit)
+                logcc = np.log(np.clip(ccdf_fit, 1e-300, 1.0))
+                alpha_pw, a_pw, r2_pw = fit_powerlaw_logccdf(logx, logcc)
+                alpha_tp, lam_tp, c0_tp, b2_tp, r2_tp = fit_tempered_logccdf(logx, x_fit, logcc)
 
-    # Meta block
-    meta_txt = "\n".join(meta_lines)
-    fig.text(0.03, 0.94, meta_txt, va="top", family="DejaVu Sans Mono", fontsize=10)
+            fig = plt.figure(figsize=(8.2, 7.2))
+            fig.suptitle(f"iter={it}   series={pretty_name(series)}   group={pretty_name(grp)}", y=0.995, fontsize=14)
 
-    # Table
-    ax = fig.add_axes([0.03, 0.05, 0.94, 0.70])
-    ax.axis("off")
-    cols = ["status", "group", "series", "B", "xmin", "KS", "R²", "note"]
-    cell_text = [[r.get(c, "") for c in cols] for r in rows]
-    col_labels = ["OK?", "group", "series", "B", "xmin", "KS", "R²", "note"]
-    tbl = ax.table(cellText=cell_text, colLabels=col_labels, loc="center", cellLoc="left")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(8)
-    tbl.scale(1.0, 1.15)
+            ax1 = fig.add_subplot(2, 1, 1)
+            ax1.set_title("CCDF (log–log) + fits", fontsize=12)
+            plot_ccdf_with_fits(ax1, view, x_fit,
+                                alpha_pw, a_pw, r2_pw,
+                                alpha_tp, lam_tp, c0_tp, b2_tp, r2_tp)
 
-    # Header style
-    for (ri, ci), cell in tbl.get_celld().items():
-        if ri == 0:
-            cell.set_text_props(weight="bold")
-            cell.set_facecolor("#f0f0f0")
+            ax2 = fig.add_subplot(2, 1, 2)
+            ax2.set_title(r"$B_{\mathrm{eff}}(x)$ on tail (tail-only + trim)", fontsize=12)
+            if x_tail is not None and beff_tail is not None:
+                plot_beff(ax2, x_tail, beff_tail, med, min_tail_count, ccdf_max, beff_window)
+            else:
+                add_box(ax2, "No stable tail after mask.\nTry smaller min_tail_count or larger samples.", loc="tl")
+                ax2.set_xscale("log")
+                ax2.set_xlabel("x (log)")
+                ax2.set_ylabel(r"$B_{\mathrm{eff}}$")
+                ax2.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.5)
 
-    # Status coloring (first column)
-    for i, r in enumerate(rows, start=1):
-        status = (r.get("status", "") or "").strip().lower()
-        cell = tbl[(i, 0)]
-        if status in ("ok", "✓", "yes"):
-            cell.set_facecolor("#d5f5d5")  # light green
-        else:
-            cell.set_facecolor("#ffe1b3")  # light orange
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
 
-    return fig
+    print(f"[ok] wrote {paper_path}")
 
-
-def _plot_density_page(
-    x: np.ndarray,
-    *,
-    title: str,
-    bins: int,
-) -> plt.Figure:
-    centers, dens = log_hist_density(x, bins=bins)
-    fig = plt.figure()
-    ax = fig.add_subplot(1, 1, 1)
-    if centers.size:
-        ax.loglog(centers, dens, marker="o", linestyle="none", markersize=2)
-    ax.set_xlabel("x (log scale)")
-    ax.set_ylabel("density per bin (log scale)")
-    ax.set_title(title + "\n(log–log: x in log scale AND y in log scale)")
-    ax.grid(True, which="both", alpha=0.3)
-    # NOTE: explicitly annotate x bins are log-spaced
-    ax.text(0.02, 0.02, "x-axis: log scale\nbins: log-spaced", transform=ax.transAxes, fontsize=9)
-    return fig
-
-
-def _plot_ccdf_page(
-    grid: np.ndarray,
-    ccdf: np.ndarray,
-    *,
-    title: str,
-    xmin: Optional[float] = None,
-    pl_fit: Optional[CCDFLinearFit] = None,
-    t_fit: Optional[CCDTemperedFit] = None,
-) -> plt.Figure:
-    fig = plt.figure()
-    ax = fig.add_subplot(1, 1, 1)
-    if grid.size:
-        ax.loglog(grid, ccdf, marker="o", linestyle="none", markersize=2, label="CCDF")
-    if xmin is not None and np.isfinite(xmin):
-        ax.axvline(float(xmin), linestyle="--", linewidth=1.0)
-    # overlay fitted lines (CCDF space)
-    if (pl_fit is not None) and grid.size:
-        m = grid >= (xmin if xmin is not None else grid[0])
-        x = grid[m]
-        y = np.exp(pl_fit.intercept) * (x ** (-pl_fit.B))
-        ax.loglog(x, y, linewidth=1.2, label=f"power-law fit (B≈{pl_fit.B:.2f}, R²={pl_fit.r2:.3f})")
-    if (t_fit is not None) and grid.size:
-        m = grid >= (xmin if xmin is not None else grid[0])
-        x = grid[m]
-        y = np.exp(t_fit.intercept) * (x ** (-t_fit.B)) * np.exp(-t_fit.lam * x)
-        ax.loglog(x, y, linewidth=1.2, label=f"tempered fit (B≈{t_fit.B:.2f}, λ≈{t_fit.lam:.2e}, R²={t_fit.r2:.3f})")
-
-    ax.set_xlabel("x (log scale)")
-    ax.set_ylabel("P(X > x) (log scale)")
-    ax.set_title(title + " — CCDF\n(log–log)")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.text(0.02, 0.02, "x-axis: log scale", transform=ax.transAxes, fontsize=9)
-    if ax.get_legend_handles_labels()[1]:
-        ax.legend(fontsize=8)
-    return fig
-
-
-def _plot_beff_page(
-    grid: np.ndarray,
-    ccdf: np.ndarray,
-    *,
-    title: str,
-    window: int,
-    xmin: Optional[float] = None,
-    B_ref: Optional[float] = None,
-) -> plt.Figure:
-    xb, beff = beff_from_ccdf_window_reg(grid, ccdf, window=window)
-    fig = plt.figure()
-    ax = fig.add_subplot(1, 1, 1)
-    if xb.size:
-        ax.semilogx(xb, beff, marker="o", linestyle="none", markersize=2, label=f"B_eff (window={window})")
-    if xmin is not None and np.isfinite(xmin):
-        ax.axvline(float(xmin), linestyle="--", linewidth=1.0)
-    if B_ref is not None and np.isfinite(B_ref):
-        ax.axhline(float(B_ref), linestyle="--", linewidth=1.0)
-    ax.set_xlabel("x (log scale)")
-    ax.set_ylabel("B_eff(x)  (local CCDF slope)")
-    ax.set_title(title + " — B_eff\n(x in log scale; y in linear scale)")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.text(0.02, 0.02, "x-axis: log scale", transform=ax.transAxes, fontsize=9)
-    if ax.get_legend_handles_labels()[1]:
-        ax.legend(fontsize=8)
-    return fig
-
-
-def _plot_hill_page(k: np.ndarray, alpha: np.ndarray, *, title: str) -> plt.Figure:
-    fig = plt.figure()
-    ax = fig.add_subplot(1, 1, 1)
-    if k.size:
-        ax.semilogx(k, alpha, marker="o", linestyle="none", markersize=2)
-    ax.set_xlabel("k (log scale)  — # top order statistics")
-    ax.set_ylabel("Hill estimate (CCDF exponent B)")
-    ax.set_title(title + " — Hill plot (diagnostic)")
-    ax.grid(True, which="both", alpha=0.3)
-    return fig
-
-
-# -----------------------------
-# Checklist heuristics
-# -----------------------------
-
-
-@dataclass
-class TailQuality:
-    ok: bool
-    reason: str
-
-
-def assess_tail_quality(
-    *,
-    fit: Optional[ParetoFit],
-    ccdf_pl: Optional[CCDFLinearFit],
-    beff_x: np.ndarray,
-    beff: np.ndarray,
-) -> TailQuality:
-    """Heuristic: mark as "good" if we see something close to a stable power-law region."""
-    if fit is None or ccdf_pl is None:
-        return TailQuality(ok=False, reason="fit failed")
-
-    # Need a reasonably large tail sample
-    if fit.n_tail < 2000:
-        return TailQuality(ok=False, reason=f"tail too small (n_tail={fit.n_tail})")
-
-    # CCDF should look close to linear on log–log on the fitted range
-    if not (np.isfinite(ccdf_pl.r2) and ccdf_pl.r2 > 0.985):
-        return TailQuality(ok=False, reason=f"CCDF not linear enough (R²={ccdf_pl.r2:.3f})")
-
-    # B_eff should be relatively flat above xmin
-    m = (beff_x >= fit.xmin)
-    if np.sum(m) < 20:
-        return TailQuality(ok=False, reason="not enough B_eff points above xmin")
-
-    vals = beff[m]
-    med = float(np.median(vals))
-    mad = float(np.median(np.abs(vals - med)))
-    if not (np.isfinite(med) and np.isfinite(mad)):
-        return TailQuality(ok=False, reason="invalid B_eff stats")
-    if mad > 0.25:
-        return TailQuality(ok=False, reason=f"B_eff too noisy (MAD={mad:.2f})")
-
-    # And it should be in the ballpark of fitted B
-    if abs(med - fit.B_ccdf) > 0.5:
-        return TailQuality(ok=False, reason=f"B_eff median {med:.2f} far from fit B {fit.B_ccdf:.2f}")
-
-    return TailQuality(ok=True, reason="clear-ish tail region")
-
-
-# -----------------------------
+# -------------------------
 # Main
-# -----------------------------
+# -------------------------
 
-
-def main() -> None:
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run_dir", type=str, required=True, help="run directory (contains tails/)")
-    ap.add_argument("--out_dir", type=str, default=None, help="output directory for plots")
-    ap.add_argument("--mode", type=str, default="latest", choices=["latest", "all", "iters"])
-    ap.add_argument("--iters", type=str, default="", help="comma-separated iters if mode=iters")
-    ap.add_argument("--groups", type=str, default="", help="comma-separated groups to plot (default: all in file)")
-    ap.add_argument(
-        "--series",
-        type=str,
-        default="grad,noise,delta",
-        help="comma-separated series to plot among {grad,noise,delta,mean} (missing keys are skipped)",
-    )
-    ap.add_argument("--bins_density", type=int, default=80)
-    ap.add_argument("--bins_ccdf", type=int, default=400)
-    ap.add_argument("--beff_window", type=int, default=21, help="smoothing window (in CCDF grid points)")
+    ap.add_argument("--run_dir", required=True)
+    ap.add_argument("--npz_glob", default="tails_iter*.npz")
+    ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--mode", choices=["latest", "iters", "all"], default="latest")
+    ap.add_argument("--iters", default="")
+    ap.add_argument("--series", default="grad,noise,delta,mean")
+    ap.add_argument("--groups", default="")
 
-    # Tail fit controls
-    ap.add_argument("--no_fit", action="store_true", help="disable alpha / tail fits")
-    ap.add_argument("--xmin_q_lo", type=float, default=0.90)
-    ap.add_argument("--xmin_q_hi", type=float, default=0.995)
-    ap.add_argument("--xmin_grid", type=int, default=50)
-    ap.add_argument("--min_tail", type=int, default=1000)
+    ap.add_argument("--grid_mode", choices=["quantile", "logspace"], default="quantile")
+    ap.add_argument("--grid_points", type=int, default=450)
+    ap.add_argument("--density_bins", type=int, default=90)
 
-    ap.add_argument("--hill", action="store_true", help="also include Hill plots")
-    ap.add_argument("--hill_k_max", type=int, default=10000)
+    ap.add_argument("--beff_window", type=int, default=31)
+    ap.add_argument("--beff_min_tail_count", type=int, default=500)
+    ap.add_argument("--beff_ccdf_max", type=float, default=0.3)
 
-    # Bundle PDF
-    ap.add_argument("--no_bundle", action="store_true", help="do not write per-iter bundled PDF")
-    ap.add_argument("--over_time", action="store_true", help="if multiple iters selected, plot fitted B over time")
-
+    ap.add_argument("--paper", action="store_true")
+    ap.add_argument("--paper_groups", default="all,attn_late,mlp_late")
     args = ap.parse_args()
 
-    run_dir = Path(args.run_dir)
-    tails_dir = run_dir / "tails"
-    if not tails_dir.exists():
-        raise SystemExit(f"tails dir not found: {tails_dir}")
+    run_dir = args.run_dir
+    out_dir = args.out_dir or os.path.join(run_dir, "figures_tail")
+    ensure_dir(out_dir)
 
-    out_dir = Path(args.out_dir) if args.out_dir else (run_dir / "figures_tail")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    files = list_npz(run_dir, args.npz_glob)
 
-    files = _list_tail_npz_files(tails_dir)
-    if not files:
-        raise SystemExit(f"No tails_iter*.npz found in {tails_dir}")
+    # choose npz files
+    if args.mode == "latest":
+        chosen = [files[-1]]
+    elif args.mode == "all":
+        chosen = files
+    else:
+        iters = [int(x.strip()) for x in args.iters.split(",") if x.strip()]
+        have = {parse_iter(p): p for p in files}
+        chosen = []
+        for it in iters:
+            if it not in have:
+                print(f"[warn] iter {it} not found for glob={args.npz_glob}")
+                continue
+            chosen.append(have[it])
+        if not chosen:
+            raise FileNotFoundError("No requested iters found.")
 
-    iters = []
-    if args.iters.strip():
-        iters = [int(x) for x in args.iters.split(",") if x.strip()]
-    picked = _pick_files(files, mode=args.mode, iters=iters)
-    if not picked:
-        raise SystemExit("No files selected (check --mode/--iters).")
+    series_list = [s.strip() for s in args.series.split(",") if s.strip()]
+    for s in series_list:
+        if s not in SERIES_TO_PREFIX:
+            raise ValueError(f"Unknown series {s}. Allowed: {sorted(SERIES_TO_PREFIX.keys())}")
 
-    want_groups = [g.strip() for g in args.groups.split(",") if g.strip()] if args.groups.strip() else None
-    want_series = [s.strip() for s in args.series.split(",") if s.strip()]
+    group_filter = [g.strip() for g in args.groups.split(",") if g.strip()] if args.groups.strip() else None
 
-    do_fit = not bool(args.no_fit)
-    do_bundle = not bool(args.no_bundle)
+    for npz_path in chosen:
+        it = parse_iter(npz_path)
+        with np.load(npz_path) as z:
+            keys = set(z.keys())
+            groups_found = set()
+            for s in series_list:
+                pref = SERIES_TO_PREFIX[s]
+                for k in keys:
+                    if k.startswith(pref + "__"):
+                        groups_found.add(k.split("__", 1)[1])
+            groups = sorted(groups_found, key=natural_key)
+            if group_filter is not None:
+                groups = [g for g in groups if g in group_filter]
 
-    # Keep fits for optional over-time plots
-    fits_over_time: Dict[Tuple[str, str], List[Tuple[int, float, float]]] = {}
+        if args.paper:
+            pgroups = [g.strip() for g in args.paper_groups.split(",") if g.strip()]
+            for s in series_list:
+                plot_paper_pdf(
+                    out_dir=out_dir,
+                    npz_path=npz_path,
+                    it=it,
+                    groups=pgroups,
+                    series=s,
+                    grid_mode=args.grid_mode,
+                    grid_points=args.grid_points,
+                    beff_window=args.beff_window,
+                    min_tail_count=args.beff_min_tail_count,
+                    ccdf_max=args.beff_ccdf_max,
+                )
+            continue
 
-    for f in picked:
-        it = _extract_iter(f)
-        npz = dict(np.load(f, allow_pickle=False))
-        avail_groups = _available_groups(npz)
-        groups = avail_groups if want_groups is None else [g for g in want_groups if g in avail_groups]
-
-        bundle: Optional[PdfPages] = None
-        bundle_path = out_dir / f"tail_tails_iter{it:07d}__ALL_PLOTS.pdf"
-        if do_bundle:
-            bundle = PdfPages(bundle_path)
-
-        # Cover/checklist page
-        meta_lines: List[str] = []
-        meta_lines.append(f"run_dir: {run_dir}")
-        meta_lines.append(f"npz: {f.relative_to(run_dir) if run_dir in f.parents else f}")
-        meta_lines.append(f"iter: {it}")
-        if "k_batches" in npz:
-            meta_lines.append(f"k_batches: {int(npz['k_batches'][0])}")
-        if "samples_per_group" in npz:
-            meta_lines.append(f"samples_per_group: {int(npz['samples_per_group'][0])}")
-        meta_lines.append("")
-        meta_lines.append("Checklist (heuristic; see JSON next to this PDF for raw numbers).")
-
-        # Table rows for the cover page
-        table_rows: List[Dict[str, str]] = []
-        checklist_json: Dict[str, Dict[str, Dict[str, object]]] = {}
-
-        # We compute checklist after we compute fits per series.
-
-        # First pass: compute all fits + store in memory for checklist page
-        computed: Dict[Tuple[str, str], Dict[str, object]] = {}
-
-        for g in groups:
-            checklist_json[g] = {}
-            series_avail = _available_series_for_group(npz, g)
-            series_to_plot = [s for s in want_series if s in series_avail]
-
-            for s in series_to_plot:
-                x = npz.get(f"{s}_abs__{g}")
-                if x is None:
-                    continue
-                x = _clean_pos(x)
-                if x.size < 50:
-                    continue
-
-                grid, ccdf = ccdf_on_log_grid(x, bins=int(args.bins_ccdf))
-                fit = None
-                pl_fit = None
-                t_fit = None
-                hill_k = np.array([])
-                hill_a = np.array([])
-
-                if do_fit:
-                    fit = clauset_pareto_fit(
-                        x,
-                        xmin_q_lo=float(args.xmin_q_lo),
-                        xmin_q_hi=float(args.xmin_q_hi),
-                        xmin_grid=int(args.xmin_grid),
-                        min_tail=int(args.min_tail),
+        bundle_path = os.path.join(out_dir, f"tail_tails_iter{it:07d}__ALL_PLOTS.pdf")
+        with np.load(npz_path) as z, PdfPages(bundle_path) as pdf:
+            for grp in groups:
+                for s in series_list:
+                    pref = SERIES_TO_PREFIX[s]
+                    key = f"{pref}__{grp}"
+                    if key not in z:
+                        continue
+                    arr = safe_positive(z[key])
+                    if arr.size < 500:
+                        continue
+                    single_path = os.path.join(out_dir, f"tail_iter{it:07d}__{s}__{grp}.pdf")
+                    plot_triplet_page(
+                        pdf=pdf,
+                        single_path=single_path,
+                        it=it,
+                        group=grp,
+                        series=s,
+                        x=arr,
+                        grid_mode=args.grid_mode,
+                        grid_points=args.grid_points,
+                        density_bins=args.density_bins,
+                        beff_window=args.beff_window,
+                        min_tail_count=args.beff_min_tail_count,
+                        ccdf_max=args.beff_ccdf_max,
                     )
-                    if (fit is not None) and grid.size:
-                        pl_fit = fit_ccdf_powerlaw(grid, ccdf, xmin=fit.xmin)
-                        t_fit = fit_ccdf_tempered(grid, ccdf, xmin=fit.xmin)
-                    if args.hill:
-                        hill_k, hill_a = hill_curve(x, k_min=50, k_max=int(args.hill_k_max))
 
-                # B_eff (smoothed)
-                beff_x, beff = beff_from_ccdf_window_reg(grid, ccdf, window=int(args.beff_window))
-
-                q = assess_tail_quality(fit=fit, ccdf_pl=pl_fit, beff_x=beff_x, beff=beff)
-
-                checklist_json[g][s] = {
-                    "ok": bool(q.ok),
-                    "reason": q.reason,
-                    "fit": None if fit is None else {
-                        "xmin": fit.xmin,
-                        "a_pdf": fit.a_pdf,
-                        "B_ccdf": fit.B_ccdf,
-                        "ks": fit.ks,
-                        "n_tail": fit.n_tail,
-                        "se_B": fit.se_B,
-                    },
-                    "ccdf_powerlaw": None if pl_fit is None else {"B": pl_fit.B, "r2": pl_fit.r2},
-                    "ccdf_tempered": None if t_fit is None else {"B": t_fit.B, "lam": t_fit.lam, "r2": t_fit.r2},
-                }
-
-                computed[(g, s)] = {
-                    "x": x,
-                    "grid": grid,
-                    "ccdf": ccdf,
-                    "fit": fit,
-                    "pl_fit": pl_fit,
-                    "t_fit": t_fit,
-                    "beff_x": beff_x,
-                    "beff": beff,
-                    "hill_k": hill_k,
-                    "hill_a": hill_a,
-                }
-
-                if fit is not None:
-                    fits_over_time.setdefault((g, s), []).append((it, fit.B_ccdf, fit.se_B))
-
-                # For the cover table
-                row: Dict[str, str] = {
-                    "status": "OK" if q.ok else "WARN",
-                    "group": g,
-                    "series": s,
-                    "B": "" if fit is None else f"{fit.B_ccdf:.2f}",
-                    "xmin": "" if fit is None else f"{fit.xmin:.3g}",
-                    "KS": "" if fit is None else f"{fit.ks:.3f}",
-                    "R²": "" if pl_fit is None else f"{pl_fit.r2:.3f}",
-                    "note": q.reason,
-                }
-                table_rows.append(row)
-
-        meta_lines.append("")
-        meta_lines.append("Notes:")
-        meta_lines.append("- If CCDF bends down at large x: likely truncation/tempering (clipping, finite batch, etc.).")
-        meta_lines.append("- B_eff is a derivative; increase --beff_window to smooth it.")
-
-        cover = _fig_checklist_table_page(
-            title=f"Tail diagnostics @ iter={it}",
-            meta_lines=meta_lines,
-            rows=table_rows,
-        )
-        _save(cover, out_dir / f"tail_checklist__iter{it:07d}.pdf", bundle=bundle)
-
-        # Also write machine-readable checklist JSON
-        checklist_path = out_dir / f"tail_checklist__iter{it:07d}.json"
-        with checklist_path.open("w", encoding="utf-8") as fp:
-            json.dump(checklist_json, fp, indent=2, ensure_ascii=False)
-
-        # Second pass: actual plots
-        for g in groups:
-            series_avail = _available_series_for_group(npz, g)
-            series_to_plot = [s for s in want_series if s in series_avail]
-            for s in series_to_plot:
-                rec = computed.get((g, s))
-                if rec is None:
-                    continue
-                x = rec["x"]
-                grid = rec["grid"]
-                ccdf = rec["ccdf"]
-                fit = rec["fit"]
-                pl_fit = rec["pl_fit"]
-                t_fit = rec["t_fit"]
-                hill_k = rec["hill_k"]
-                hill_a = rec["hill_a"]
-
-                # density
-                fig = _plot_density_page(x, title=f"|{s}| density (group={g}, iter={it})", bins=int(args.bins_density))
-                _save(fig, out_dir / f"density_{s}__{g}__iter{it:07d}.pdf", bundle=bundle)
-
-                # CCDF
-                fig = _plot_ccdf_page(
-                    grid,
-                    ccdf,
-                    title=f"|{s}| (group={g}, iter={it})",
-                    xmin=None if fit is None else fit.xmin,
-                    pl_fit=pl_fit,
-                    t_fit=t_fit,
-                )
-                _save(fig, out_dir / f"ccdf_{s}__{g}__iter{it:07d}.pdf", bundle=bundle)
-
-                # B_eff
-                fig = _plot_beff_page(
-                    grid,
-                    ccdf,
-                    title=f"|{s}| (group={g}, iter={it})",
-                    window=int(args.beff_window),
-                    xmin=None if fit is None else fit.xmin,
-                    B_ref=None if fit is None else fit.B_ccdf,
-                )
-                _save(fig, out_dir / f"beff_{s}__{g}__iter{it:07d}.pdf", bundle=bundle)
-
-                # Hill plot (optional)
-                if args.hill:
-                    fig = _plot_hill_page(hill_k, hill_a, title=f"|{s}| (group={g}, iter={it})")
-                    _save(fig, out_dir / f"hill_{s}__{g}__iter{it:07d}.pdf", bundle=bundle)
-
-        if bundle is not None:
-            bundle.close()
-            print(f"[OK] Bundled PDF: {bundle_path}")
-
-        print(f"[OK] Plotted iter={it} from {f.name} -> {out_dir}")
-
-    # Optional: B over time
-    if args.over_time and len(picked) >= 2:
-        for (g, s), rows in fits_over_time.items():
-            rows = sorted(rows, key=lambda t: t[0])
-            its = np.array([r[0] for r in rows], dtype=np.int64)
-            Bs = np.array([r[1] for r in rows], dtype=np.float64)
-            se = np.array([r[2] for r in rows], dtype=np.float64)
-            fig = plt.figure()
-            ax = fig.add_subplot(1, 1, 1)
-            ax.errorbar(its, Bs, yerr=se, fmt="o", markersize=3, capsize=2)
-            ax.set_xlabel("iteration")
-            ax.set_ylabel("B (CCDF exponent)  — Clauset fit")
-            ax.set_title(f"Tail exponent over time: series={s}, group={g}")
-            ax.grid(True, which="both", alpha=0.3)
-            _save(fig, out_dir / f"B_over_time__{s}__{g}.pdf", bundle=None)
-
-        print(f"[OK] Wrote over-time plots -> {out_dir}")
-
-    print("[DONE]")
+        print(f"[ok] wrote {bundle_path}")
 
 
 if __name__ == "__main__":
     main()
+
