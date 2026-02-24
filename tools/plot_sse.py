@@ -4,33 +4,38 @@
 """
 tools/plot_sse.py
 
-Plots SSE diagnostics saved by c1bench/sse_diag.py.
+Readable SSE plots for component magnitudes |g_i| and |U_i| saved by c1bench/sse_diag.py.
 
-Fixes:
-- g_abs and u_abs arrays may have slightly different lengths (due to per-tensor sampling/concatenation).
-  We now align by truncating to min(len(g), len(u)) BEFORE any boolean masks, so broadcasting errors cannot happen.
-- Drops the very first data point (often lr=0 at iter=0), which can create log-scale / fit artifacts.
+Key improvements (vs scatter):
+- Use 2D density (hexbin) in (log10|g|, log10|U|) instead of millions of points.
+- Overlay binned quantile summary: median + q10/q90 in log-|g| bins.
+- Add CCDF(|g_i|) and CCDF(|U_i|) pages (log-log) for each group (tail comparison).
+- Robust to slight g/u length mismatch: align by truncation to min(len).
+- Drops first aligned point to avoid iter=0 / lr=0 artifacts.
 
-Outputs (default):
-  <run_dir>/figures_tail/
-    - sse__iterXXXXXXX__<group>.pdf (per group per iter)
-    - sse__iterXXXXXXX__ALL_GROUPS.pdf (combined multipage per iter)
+Outputs:
+  <run_dir>/figures_sse/
+    - sse__iterXXXXXXX__ALL_GROUPS.pdf (multipage: per group)
+    - sse__iterXXXXXXX__<group>.pdf    (optional per-group)
 
 Usage:
-  python tools/plot_sse.py --run_dir out/A0_adamw_base --mode iters --iters 700,1800,1900
+  python tools/plot_sse.py --run_dir out/A0_adamw_all_diag --mode iters --iters 200,800,1990
 """
 
 import argparse
 import glob
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 
+# -----------------------------
+# Utils
+# -----------------------------
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
@@ -68,90 +73,178 @@ def _get_arr(z, prefix: str, group: str) -> Optional[np.ndarray]:
     return x
 
 
-def _align_pair(g: np.ndarray, u: np.ndarray, drop_first: bool = True) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Align g and u arrays by truncating to same length (min len).
-    Optionally drop the first aligned point (to remove iter=0 artifacts).
-    """
+def _align_pair(g: np.ndarray, u: np.ndarray, drop_first: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     n = min(g.size, u.size)
     if n <= 0:
         return g[:0], u[:0]
-    g2 = g[:n]
-    u2 = u[:n]
+    g = g[:n]
+    u = u[:n]
     if drop_first and n >= 2:
-        g2 = g2[1:]
-        u2 = u2[1:]
-    return g2, u2
+        g = g[1:]
+        u = u[1:]
+    return g, u
 
 
-def _binned_median(x: np.ndarray, y: np.ndarray, nbins: int = 30) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+# -----------------------------
+# Plot helpers
+# -----------------------------
+def _binned_quantiles(
+    x: np.ndarray,
+    y: np.ndarray,
+    nbins: int = 40,
+    q_lo: float = 0.10,
+    q_hi: float = 0.90,
+    min_per_bin: int = 200
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Bin x in log-space, compute median and IQR for y in each bin.
-    Returns: bin_centers, med, iqr (q75-q25).
+    Bin x in log-space. For y in each bin: q10, median, q90.
+    Returns: centers, qlo, q50, qhi
     """
-    x = x.astype(np.float64, copy=False)
-    y = y.astype(np.float64, copy=False)
     m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     x = x[m]
     y = y[m]
-    if x.size < 10:
-        return np.array([]), np.array([]), np.array([])
+    if x.size < 1000:
+        return np.array([]), np.array([]), np.array([]), np.array([])
 
-    xmin = np.quantile(x, 0.01)
-    xmax = np.quantile(x, 0.99)
-    xmin = max(xmin, x.min())
+    xmin = float(np.quantile(x, 0.01))
+    xmax = float(np.quantile(x, 0.99))
+    xmin = max(xmin, float(x.min()))
     xmax = max(xmax, xmin * 1.001)
 
     edges = np.logspace(np.log10(xmin), np.log10(xmax), nbins + 1)
-    idx = np.digitize(x, edges) - 1
+    bin_id = np.digitize(x, edges) - 1
 
-    centers = []
-    meds = []
-    iqrs = []
+    centers, ql, q50, qh = [], [], [], []
     for b in range(nbins):
-        mb = idx == b
-        if mb.sum() < 20:
+        mb = bin_id == b
+        if int(mb.sum()) < min_per_bin:
             continue
         yy = y[mb]
         centers.append(np.sqrt(edges[b] * edges[b + 1]))
-        q25 = np.quantile(yy, 0.25)
-        q50 = np.quantile(yy, 0.50)
-        q75 = np.quantile(yy, 0.75)
-        meds.append(q50)
-        iqrs.append(q75 - q25)
-    return np.array(centers), np.array(meds), np.array(iqrs)
+        ql.append(np.quantile(yy, q_lo))
+        q50.append(np.quantile(yy, 0.50))
+        qh.append(np.quantile(yy, q_hi))
+
+    return np.array(centers), np.array(ql), np.array(q50), np.array(qh)
 
 
-def _fit_beta_loglog(x: np.ndarray, y: np.ndarray, qmin: float = 0.90, qmax: float = 0.995) -> Optional[tuple[float, float]]:
+def _ccdf_curve(x: np.ndarray, q_lo=0.001, q_hi=0.99999, nbins=700):
     """
-    Fit y ≈ A * x^beta on the tail by linear regression on log-log,
-    using x-range between quantiles [qmin, qmax].
-    Returns (beta, r2) or None.
+    CCDF on log-spaced x-grid between quantiles.
+    Returns grid_x, ccdf
     """
-    m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
-    x = x[m]
-    y = y[m]
-    if x.size < 200:
-        return None
+    x = x[np.isfinite(x)]
+    x = x[x > 0]
+    if x.size < 1000:
+        return np.array([]), np.array([])
+    x = np.sort(x)
+    n = x.size
+    xmin = float(np.quantile(x, q_lo))
+    xmax = float(np.quantile(x, q_hi))
+    xmin = max(xmin, float(x[0]))
+    xmax = max(xmax, xmin * 1.001)
 
-    lo = np.quantile(x, qmin)
-    hi = np.quantile(x, qmax)
-    mm = (x >= lo) & (x <= hi)
-    if mm.sum() < 50:
-        return None
+    g = np.logspace(np.log10(xmin), np.log10(xmax), nbins)
+    idx = np.searchsorted(x, g, side="right")
+    cc = (n - idx) / n
+    cc = np.clip(cc, 1.0/(n+1.0), 1.0)
+    return g, cc
 
-    X = np.log(x[mm])
-    Y = np.log(y[mm])
-    slope, intercept = np.polyfit(X, Y, 1)  # Y = intercept + slope*X
+
+def _fit_beta_tail_on_median(bx: np.ndarray, by: np.ndarray, qmin=0.80, qmax=0.98):
+    """
+    Fit log(by) = a + beta*log(bx) on tail bins (quantile window).
+    Returns beta, r2 or (nan,nan) if not enough.
+    """
+    if bx.size < 10:
+        return np.nan, np.nan
+    m = np.isfinite(bx) & np.isfinite(by) & (bx > 0) & (by > 0)
+    bx = bx[m]; by = by[m]
+    if bx.size < 10:
+        return np.nan, np.nan
+
+    lo = np.quantile(bx, qmin)
+    hi = np.quantile(bx, qmax)
+    mm = (bx >= lo) & (bx <= hi)
+    if mm.sum() < 5:
+        return np.nan, np.nan
+
+    X = np.log(bx[mm])
+    Y = np.log(by[mm])
+    slope, intercept = np.polyfit(X, Y, 1)
     Yhat = intercept + slope * X
     ss_res = float(np.sum((Y - Yhat) ** 2))
     ss_tot = float(np.sum((Y - np.mean(Y)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    beta = float(slope)
-    return beta, r2
+    return float(slope), float(r2)
 
 
-def plot_one(npz_path: str, out_dir: str, groups: Optional[List[str]] = None, nbins: int = 30) -> None:
+def _plot_density_quantiles(ax, g, u, title: str):
+    """
+    2D density in log-space + quantile summary.
+    """
+    m = np.isfinite(g) & np.isfinite(u) & (g > 0) & (u > 0)
+    g = g[m]; u = u[m]
+    if g.size < 2000:
+        ax.text(0.1, 0.5, "not enough points", transform=ax.transAxes)
+        return
+
+    lg = np.log10(g)
+    lu = np.log10(u)
+
+    hb = ax.hexbin(lg, lu, gridsize=140, bins="log", mincnt=5)
+    cb = plt.colorbar(hb, ax=ax)
+    cb.set_label("log10(counts)")
+
+    bx, q10, q50, q90 = _binned_quantiles(g, u, nbins=45, q_lo=0.10, q_hi=0.90, min_per_bin=200)
+    if bx.size > 0:
+        ax.plot(np.log10(bx), np.log10(q50), linewidth=2.2, label="median")
+        ax.plot(np.log10(bx), np.log10(q10), linewidth=1.5, linestyle="--", label="q10/q90")
+        ax.plot(np.log10(bx), np.log10(q90), linewidth=1.5, linestyle="--")
+
+        beta, r2 = _fit_beta_tail_on_median(bx, q50, qmin=0.80, qmax=0.98)
+        ax.text(
+            0.02, 0.98,
+            f"tail fit on median: beta={beta:.3g}, R²={r2:.3f}",
+            transform=ax.transAxes,
+            va="top", ha="left",
+            fontsize=10,
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none")
+        )
+
+    ax.set_xlabel("log10 |g_i|")
+    ax.set_ylabel("log10 |U_i|")
+    ax.set_title(title)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend(loc="lower right")
+
+
+def _plot_ccdf_pair(ax, g_abs, u_abs, title: str):
+    """
+    CCDF(|g_i|) and CCDF(|U_i|) on log-log.
+    """
+    gx, gcc = _ccdf_curve(g_abs, q_lo=0.001, q_hi=0.99999, nbins=700)
+    ux, ucc = _ccdf_curve(u_abs, q_lo=0.001, q_hi=0.99999, nbins=700)
+
+    if gx.size == 0 or ux.size == 0:
+        ax.text(0.1, 0.5, "not enough points", transform=ax.transAxes)
+        return
+
+    ax.plot(gx, gcc, linewidth=2.0, label="CCDF(|g_i|)")
+    ax.plot(ux, ucc, linewidth=2.0, label="CCDF(|U_i|)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("x")
+    ax.set_ylabel("P(>|x|)")
+    ax.set_title(title)
+    ax.grid(True, which="both", linestyle="--", alpha=0.35)
+    ax.legend(loc="best")
+
+
+# -----------------------------
+# Main plotting
+# -----------------------------
+def plot_one(npz_path: str, out_dir: str, groups: Optional[List[str]] = None, save_per_group: bool = False) -> None:
     it = _parse_iter(npz_path)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -172,63 +265,28 @@ def plot_one(npz_path: str, out_dir: str, groups: Optional[List[str]] = None, nb
                 if g is None or u is None:
                     continue
 
-                # Align lengths safely and drop first point (iter=0 artifacts)
                 g, u = _align_pair(g, u, drop_first=True)
-
-                # Filter valid positive pairs (after alignment!)
                 m = np.isfinite(g) & np.isfinite(u) & (g > 0) & (u > 0)
-                g = g[m]
-                u = u[m]
-                if g.size < 200:
+                g = g[m]; u = u[m]
+                if g.size < 2000:
                     continue
 
-                # Optional downsample for scatter visibility
-                if g.size > 200_000:
-                    rng = np.random.default_rng(0)
-                    idx = rng.choice(g.size, size=200_000, replace=False)
-                    g_s = g[idx]
-                    u_s = u[idx]
-                else:
-                    g_s = g
-                    u_s = u
-
-                # Binned median curve
-                bx, by, biqr = _binned_median(g, u, nbins=nbins)
-
-                # Tail fit beta
-                fit = _fit_beta_loglog(g, u, qmin=0.90, qmax=0.995)
-                if fit is not None:
-                    beta, r2 = fit
-                    fit_txt = f"fit on tail: beta={beta:.3g}, R²={r2:.3f}"
-                else:
-                    beta, r2 = np.nan, np.nan
-                    fit_txt = "fit on tail: n/a"
-
-                fig, ax = plt.subplots(figsize=(7.5, 5.2))
-                ax.scatter(g_s, u_s, s=2, alpha=0.25, label="samples (|grad|, |U|)")
-                if bx.size > 0:
-                    ax.plot(bx, by, linewidth=2.0, label="binned median")
-
-                # Add fitted line for visualization if available
-                if fit is not None and bx.size > 0:
-                    # build a fit line in x-range of binned curve
-                    xx = np.logspace(np.log10(bx.min()), np.log10(bx.max()), 200)
-                    # y = A x^beta; estimate A from median point
-                    A = by[len(by)//2] / (bx[len(bx)//2] ** beta)
-                    yy = A * xx ** beta
-                    ax.plot(xx, yy, linewidth=2.0, label="power fit (visual)")
-
-                ax.set_xscale("log")
-                ax.set_yscale("log")
-                ax.set_xlabel(r"$\|g\|$ samples (abs coord)")
-                ax.set_ylabel(r"$\|U\|$ samples (abs coord)")
-                ax.set_title(f"SSE scatter (iter={it}, group={grp})\n{fit_txt}\n(first point dropped)")
-                ax.grid(True, which="both", linestyle="--", linewidth=0.6, alpha=0.5)
-                ax.legend(loc="best")
-
-                out_path = os.path.join(out_dir, f"sse__iter{it:07d}__{grp}.pdf")
-                fig.savefig(out_path, bbox_inches="tight")
+                # Page 1: density + quantiles
+                fig = plt.figure(figsize=(8.5, 6.0))
+                ax = fig.add_subplot(111)
+                _plot_density_quantiles(ax, g, u, title=f"SSE (iter={it}, group={grp})")
                 combined.savefig(fig, bbox_inches="tight")
+                if save_per_group:
+                    fig.savefig(os.path.join(out_dir, f"sse__iter{it:07d}__{grp}__density.pdf"), bbox_inches="tight")
+                plt.close(fig)
+
+                # Page 2: CCDF(|g|) vs CCDF(|U|)
+                fig = plt.figure(figsize=(8.5, 5.5))
+                ax = fig.add_subplot(111)
+                _plot_ccdf_pair(ax, g, u, title=f"Component tails (iter={it}, group={grp})")
+                combined.savefig(fig, bbox_inches="tight")
+                if save_per_group:
+                    fig.savefig(os.path.join(out_dir, f"sse__iter{it:07d}__{grp}__ccdf.pdf"), bbox_inches="tight")
                 plt.close(fig)
 
     print(f"[ok] wrote {combined_path}")
@@ -241,11 +299,11 @@ def main():
     ap.add_argument("--mode", choices=["latest", "iters", "all"], default="latest")
     ap.add_argument("--iters", default="", help="comma-separated iters if mode=iters")
     ap.add_argument("--groups", default="", help="comma-separated groups; default all")
-    ap.add_argument("--nbins", type=int, default=30, help="bins for binned median")
+    ap.add_argument("--save_per_group", action="store_true", help="also save per-group PDFs")
     args = ap.parse_args()
 
     run_dir = args.run_dir
-    out_dir = args.out_dir or os.path.join(run_dir, "figures_tail")
+    out_dir = args.out_dir or os.path.join(run_dir, "figures_sse")
     groups = [g.strip() for g in args.groups.split(",") if g.strip()] or None
 
     files = _list_npz(run_dir)
@@ -266,7 +324,7 @@ def main():
             chosen.append(have[it])
 
     for p in chosen:
-        plot_one(p, out_dir, groups=groups, nbins=args.nbins)
+        plot_one(p, out_dir, groups=groups, save_per_group=args.save_per_group)
 
 
 if __name__ == "__main__":
