@@ -1,4 +1,6 @@
-"""Unified training entrypoint for C1 experiments.
+# train.py
+"""
+Unified training entrypoint for C1 experiments.
 
 Supported optimizers:
   - sgd
@@ -10,6 +12,11 @@ Supported optimizers:
   - selector (DC-based switching)
 
 All runs log to a run directory with JSONL logs + checkpoints.
+
+IMPORTANT FIX (vs your current main):
+  ✅ dc_diag.maybe_run / tail_diag.maybe_run / selector.maybe_select are now called
+     EVERY ITERATION after the optimizer step + decoupled weight decay, so diag_every / tail_every / sel_every
+     actually work (previously they only ran inside save_interval block).
 """
 
 from __future__ import annotations
@@ -30,12 +37,15 @@ from model import GPT, GPTConfig
 
 from c1bench.dc_diag import DCDiagConfig, DCDiagnostics
 from c1bench.tail_diag import TailDiagConfig, TailDiagnostics
-from c1bench.sse_diag import SSEDiagConfig, SSEDiagnostics  # <-- NEW
+from c1bench.sse_diag import SSEDiagConfig, SSEDiagnostics  # <-- NEW (SSE)
 from c1bench.optim_factory import DecayGroups, make_optimizer, split_decay_params
 from c1bench.selector import Selector, SelectorConfig
 from c1bench.utils import JsonlWriter, mkdir_p, now_iso, set_seed
 
 
+# -----------------------------
+# CLI + config
+# -----------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("config", type=str, help="Path to configs/*.py")
@@ -74,96 +84,9 @@ def load_config(py_file: str) -> Dict[str, Any]:
     return cfg
 
 
-def get_lr(
-    it: int,
-    *,
-    learning_rate: float,
-    warmup_iters: int,
-    lr_decay_iters: int,
-    min_lr: float,
-    lr_schedule: str = "cosine",
-) -> float:
-    """
-    LR schedule with warmup.
-
-    lr_schedule:
-      - "cosine": cosine decay to min_lr
-      - "linear": linear decay to min_lr
-    """
-    # 1) linear warmup
-    if it < warmup_iters:
-        return learning_rate * it / max(1, warmup_iters)
-
-    # 2) after decay window -> clamp to min_lr
-    if it > lr_decay_iters:
-        return min_lr
-
-    # 3) decay within [warmup_iters, lr_decay_iters]
-    decay_ratio = (it - warmup_iters) / max(1, (lr_decay_iters - warmup_iters))
-    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
-
-    lr_schedule = str(lr_schedule).lower()
-    if lr_schedule == "cosine":
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    elif lr_schedule == "linear":
-        coeff = 1.0 - decay_ratio
-    else:
-        raise ValueError(f"Unknown lr_schedule: {lr_schedule}")
-
-    return min_lr + coeff * (learning_rate - min_lr)
-
-
-def openwebtext_get_batch(
-    data_dir: Path, split: str, batch_size: int, block_size: int, device: str
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    data = np.memmap(data_dir / f"{split}.bin", dtype=np.uint16, mode="r")
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64)) for i in ix])
-    if device == "cuda":
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
-    else:
-        x = x.to(device)
-        y = y.to(device)
-    return x, y
-
-
-@torch.no_grad()
-def estimate_loss(
-    model: GPT, data_dir: Path, batch_size: int, block_size: int, device: str, eval_iters: int
-) -> Dict[str, float]:
-    model.eval()
-    out: Dict[str, float] = {}
-    for split in ["train", "val"]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = openwebtext_get_batch(data_dir, split, batch_size, block_size, device)
-            _, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = float(losses.mean())
-    model.train()
-    return out
-
-
-def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = lr
-
-
-@torch.no_grad()
-def _apply_decoupled_weight_decay(decay_groups: DecayGroups, weight_decay: float, lr: float) -> None:
-    if weight_decay <= 0:
-        return
-    scale = 1.0 - lr * weight_decay
-    for p in decay_groups.decay:
-        p.mul_(scale)
-
-
-# ----------------------------
+# -----------------------------
 # Robust --set parsing helpers
-# ----------------------------
-
+# -----------------------------
 def _split_top_level_commas(s: str) -> list[str]:
     """Split by commas only at top level (not inside quotes/brackets)."""
     out: list[str] = []
@@ -171,7 +94,6 @@ def _split_top_level_commas(s: str) -> list[str]:
     depth_sq = depth_cu = depth_pa = 0
     in_squote = in_dquote = False
     esc = False
-
     for ch in s:
         if esc:
             buf.append(ch)
@@ -181,7 +103,6 @@ def _split_top_level_commas(s: str) -> list[str]:
             buf.append(ch)
             esc = True
             continue
-
         if ch == "'" and not in_dquote:
             in_squote = not in_squote
             buf.append(ch)
@@ -190,11 +111,9 @@ def _split_top_level_commas(s: str) -> list[str]:
             in_dquote = not in_dquote
             buf.append(ch)
             continue
-
         if in_squote or in_dquote:
             buf.append(ch)
             continue
-
         if ch == "[":
             depth_sq += 1
             buf.append(ch)
@@ -219,16 +138,13 @@ def _split_top_level_commas(s: str) -> list[str]:
             depth_pa = max(0, depth_pa - 1)
             buf.append(ch)
             continue
-
         if ch == "," and depth_sq == 0 and depth_cu == 0 and depth_pa == 0:
             item = "".join(buf).strip()
             if item:
                 out.append(item)
             buf = []
             continue
-
         buf.append(ch)
-
     last = "".join(buf).strip()
     if last:
         out.append(last)
@@ -257,6 +173,7 @@ def _parse_set_overrides(set_args: list[str]) -> Dict[str, Any]:
         k = k.strip()
         v_str = v_str.strip()
 
+        # strip surrounding quotes for raw strings
         if len(v_str) >= 2 and v_str[0] == v_str[-1] and v_str[0] in ("'", '"'):
             v_eval = v_str[1:-1]
         else:
@@ -282,14 +199,96 @@ def _parse_set_overrides(set_args: list[str]) -> Dict[str, Any]:
     return out
 
 
+# -----------------------------
+# LR schedule + data
+# -----------------------------
+def get_lr(
+    it: int,
+    *,
+    learning_rate: float,
+    warmup_iters: int,
+    lr_decay_iters: int,
+    min_lr: float,
+    lr_schedule: str = "cosine",
+) -> float:
+    """LR schedule with warmup."""
+    if it < warmup_iters:
+        return learning_rate * it / max(1, warmup_iters)
+    if it > lr_decay_iters:
+        return min_lr
+    decay_ratio = (it - warmup_iters) / max(1, (lr_decay_iters - warmup_iters))
+    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+    lr_schedule = str(lr_schedule).lower()
+    if lr_schedule == "cosine":
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    elif lr_schedule == "linear":
+        coeff = 1.0 - decay_ratio
+    else:
+        raise ValueError(f"Unknown lr_schedule: {lr_schedule}")
+    return min_lr + coeff * (learning_rate - min_lr)
+
+
+def openwebtext_get_batch(
+    data_dir: Path, split: str, batch_size: int, block_size: int, device: str
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    data = np.memmap(data_dir / f"{split}.bin", dtype=np.uint16, mode="r")
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64)) for i in ix])
+    if device == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
+
+
+@torch.no_grad()
+def estimate_loss(
+    model: GPT,
+    data_dir: Path,
+    batch_size: int,
+    block_size: int,
+    device: str,
+    eval_iters: int,
+) -> Dict[str, float]:
+    model.eval()
+    out: Dict[str, float] = {}
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = openwebtext_get_batch(data_dir, split, batch_size, block_size, device)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = float(losses.mean())
+    model.train()
+    return out
+
+
+def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+@torch.no_grad()
+def _apply_decoupled_weight_decay(decay_groups: DecayGroups, weight_decay: float, lr: float) -> None:
+    if weight_decay <= 0:
+        return
+    scale = 1.0 - lr * weight_decay
+    for p in decay_groups.decay:
+        p.mul_(scale)
+
+
+# -----------------------------
+# main
+# -----------------------------
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
-
     overrides = _parse_set_overrides(args.set)
     for k, v in overrides.items():
         cfg[k] = v
-
     if args.lr_schedule is not None:
         cfg["lr_schedule"] = str(args.lr_schedule)
 
@@ -308,16 +307,13 @@ def main() -> None:
     batch_size = int(cfg.get("batch_size", 12))
     grad_accum = int(cfg.get("gradient_accumulation_steps", 5))
     max_iters = int(cfg.get("max_iters", 2000))
-
     learning_rate = float(cfg.get("learning_rate", 6e-4))
     min_lr = float(cfg.get("min_lr", 6e-5))
     warmup_iters = int(cfg.get("warmup_iters", 200))
     lr_decay_iters = int(cfg.get("lr_decay_iters", max_iters))
     lr_schedule = str(cfg.get("lr_schedule", "cosine")).lower()
-
     weight_decay = float(cfg.get("weight_decay", 0.1))
     grad_clip = float(cfg.get("grad_clip", 1.0))
-
     eval_interval = int(cfg.get("eval_interval", 200))
     eval_iters = int(cfg.get("eval_iters", 50))
     log_interval = int(cfg.get("log_interval", 10))
@@ -331,7 +327,7 @@ def main() -> None:
     rho = float(cfg.get("rho", 0.03))  # SophiaG
     muon_momentum = float(cfg.get("muon_momentum", 0.95))
 
-    # selector config
+    # selector
     selector_candidates = list(cfg.get("selector_candidates", ["sgd", "adamw", "lion", "muon", "sophiag", "lamb"]))
     sel_every = int(cfg.get("sel_every", 100))
     sel_min_ep = int(cfg.get("sel_min_ep", 200))
@@ -346,7 +342,6 @@ def main() -> None:
         diag_enabled = True
     if args.no_diag:
         diag_enabled = False
-
     diag_every = int(cfg.get("diag_every", 100))
     diag_probes = int(cfg.get("diag_probes", 8))
     diag_tail_samples = int(cfg.get("diag_tail_samples", 80000))
@@ -360,7 +355,7 @@ def main() -> None:
     seed = int(args.seed if args.seed is not None else cfg.get("seed", 1337))
     set_seed(seed)
 
-    # heavy-tail diagnostics (|g| and |g - E[g]|), logged to tail.jsonl and tails/*.npz
+    # heavy-tail diagnostics (optional)
     tail_enabled = bool(cfg.get("tail_diag", False))
     tail_every = int(cfg.get("tail_every", diag_every))
     tail_k_batches = int(cfg.get("tail_k_batches", 32))
@@ -374,7 +369,7 @@ def main() -> None:
     tail_fp32 = bool(cfg.get("tail_fp32", True))
     tail_log_delta = bool(cfg.get("tail_log_delta", True))
 
-    # SSE diagnostics (frequent)
+    # SSE diagnostics (optional)
     sse_enabled = bool(cfg.get("sse_diag", False))
     sse_every = int(cfg.get("sse_every", 10))
     sse_samples_per_group = int(cfg.get("sse_samples_per_group", 50000))
@@ -384,10 +379,11 @@ def main() -> None:
     sse_seed = int(cfg.get("sse_seed", 1337))
     sse_fp32 = bool(cfg.get("sse_fp32", True))
 
+    # device/dtype
     device = args.device or cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
-
     dtype_str = args.dtype or cfg.get(
-        "dtype", "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
+        "dtype",
+        "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16",
     )
     if dtype_str == "float32":
         dtype = torch.float32
@@ -395,16 +391,15 @@ def main() -> None:
         dtype = torch.bfloat16
     else:
         dtype = torch.float16
-
     if device == "cuda" and dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
         print("[warn] bfloat16 not supported on this GPU; using float16 instead")
         dtype_str = "float16"
         dtype = torch.float16
 
+    # run dir
     run_name = args.run_name or cfg.get("run_name", None)
     if run_name is None:
         run_name = f"{dataset}__{optimizer_name}__{now_iso()}__seed{seed}"
-
     out_dir = mkdir_p(Path(args.out_root) / run_name)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
@@ -419,19 +414,20 @@ def main() -> None:
             "dtype": dtype_str,
         },
     }
-
     (out_dir / "config_resolved.json").write_text(json.dumps(resolved, indent=2), encoding="utf-8")
     (out_dir / "meta.json").write_text(
         json.dumps({"config": resolved, "run_name": run_name, "optimizer": optimizer_name, "seed": seed}, indent=2),
         encoding="utf-8",
     )
 
+    # logs
     step_log = JsonlWriter(out_dir / "step.jsonl")
     diag_log = JsonlWriter(out_dir / "diag.jsonl") if diag_enabled else None
     tail_log = JsonlWriter(out_dir / "tail.jsonl") if tail_enabled else None
     sse_log = JsonlWriter(out_dir / "sse.jsonl") if sse_enabled else None
     sel_log = JsonlWriter(out_dir / "sel.jsonl") if optimizer_name == "selector" else None
 
+    # model
     model_config = GPTConfig(
         block_size=block_size,
         vocab_size=50304,
@@ -490,6 +486,7 @@ def main() -> None:
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and dtype in (torch.float16,)))
 
+    # diagnostics objects
     dc_diag: Optional[DCDiagnostics] = None
     if diag_enabled:
         dc_diag = DCDiagnostics(
@@ -537,6 +534,7 @@ def main() -> None:
         )
         sse_diag = SSEDiagnostics(sse_cfg, run_dir=out_dir, log_writer=sse_log)
 
+    # resume
     iter_num = 0
     best_val = 1e9
     if args.resume is not None:
@@ -544,6 +542,7 @@ def main() -> None:
         model.load_state_dict(ckpt["model"])
         iter_num = int(ckpt.get("iter_num", 0))
         best_val = float(ckpt.get("best_val", 1e9))
+
         if optimizer_name == "selector":
             for name, opt in optim_map.items():
                 if name in ckpt.get("optimizers", {}):
@@ -553,10 +552,16 @@ def main() -> None:
         else:
             assert optim is not None
             optim.load_state_dict(ckpt["optimizer"])
+
         if "scaler" in ckpt and ckpt["scaler"] is not None:
             scaler.load_state_dict(ckpt["scaler"])
 
+    # helpers
+    def _get_batch(split: str):
+        return openwebtext_get_batch(data_dir, split, batch_size, block_size, device)
+
     t0 = time.time()
+
     for it in range(iter_num, max_iters):
         lr = get_lr(
             it,
@@ -567,6 +572,7 @@ def main() -> None:
             lr_schedule=lr_schedule,
         )
 
+        # zero grad
         if optimizer_name == "selector":
             for opt in optim_map.values():
                 opt.zero_grad(set_to_none=True)
@@ -574,19 +580,24 @@ def main() -> None:
             assert optim is not None
             optim.zero_grad(set_to_none=True)
 
-        # For SSE, capture weights before step (only at sse_every)
+        # SSE pre (only on it % sse_every == 0 internally)
         if sse_diag is not None:
             sse_diag.capture_pre(it=it, model=model, lr=lr, device=device)
 
         lossf = 0.0
         for _micro in range(grad_accum):
-            X, Y = openwebtext_get_batch(data_dir, "train", batch_size, block_size, device)
+            X, Y = _get_batch("train")
             with torch.autocast(device_type=device, dtype=dtype, enabled=(dtype != torch.float32)):
                 _, loss = model(X, Y)
                 loss = loss / grad_accum
             lossf += float(loss.detach())
-            scaler.scale(loss).backward() if scaler.is_enabled() else loss.backward()
 
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+        # unscale + clip
         if scaler.is_enabled():
             if selector is not None:
                 scaler.unscale_(selector.active_optimizer)
@@ -599,8 +610,10 @@ def main() -> None:
 
         bs_tokens = batch_size * block_size
 
+        # optimizer step
         if optimizer_name == "selector":
             assert selector is not None
+
             for _opt in selector.optimizers.values():
                 _set_optimizer_lr(_opt, lr)
                 for _g in _opt.param_groups:
@@ -629,12 +642,45 @@ def main() -> None:
             else:
                 optim.step()
 
-        # For SSE, capture after step but BEFORE decoupled WD
+        # SSE post (after step, before decoupled WD)
         if sse_diag is not None:
             sse_diag.capture_post(it=it, model=model, lr=lr, device=device)
 
+        # decoupled WD
         _apply_decoupled_weight_decay(decay_groups, weight_decay=weight_decay, lr=lr)
 
+        # -----------------------------
+        # ✅ FIX: run diagnostics on their own schedule (not tied to save_interval)
+        # -----------------------------
+        if dc_diag is not None:
+            if optimizer_name == "selector":
+                assert selector is not None
+                dc_diag.maybe_run(
+                    it=it,
+                    model=model,
+                    get_batch=_get_batch,
+                    optimizer_name=selector.active_name,
+                    optimizer=selector.active_optimizer,
+                    bs_tokens=bs_tokens,
+                )
+            else:
+                assert optim is not None
+                dc_diag.maybe_run(
+                    it=it,
+                    model=model,
+                    get_batch=_get_batch,
+                    optimizer_name=optimizer_name,
+                    optimizer=optim,
+                    bs_tokens=bs_tokens,
+                )
+
+        if tail_diag is not None:
+            tail_diag.maybe_run(it=it, model=model, get_batch=_get_batch)
+
+        if selector is not None:
+            selector.maybe_select(step=it, model=model, get_batch=_get_batch, bs_tokens=bs_tokens)
+
+        # timing + logs
         dt = time.time() - t0
         if it % log_interval == 0:
             rec = {
@@ -647,6 +693,7 @@ def main() -> None:
             step_log.write(rec)
             print(json.dumps(rec))
 
+        # eval
         if it % eval_interval == 0 or it == max_iters - 1:
             losses = estimate_loss(model, data_dir, batch_size, block_size, device, eval_iters)
             rec = {"iter": it, "train_loss": losses["train"], "val_loss": losses["val"]}
@@ -654,6 +701,7 @@ def main() -> None:
             print(json.dumps({"event": "eval", **rec}))
             best_val = min(best_val, float(losses["val"]))
 
+        # checkpoint save ONLY
         if it % save_interval == 0 or it == max_iters - 1:
             ckpt_path = out_dir / "checkpoints" / f"ckpt_iter{it:07d}.pt"
             ckpt_out: Dict[str, Any] = {
@@ -669,43 +717,7 @@ def main() -> None:
                 ckpt_out["optimizer"] = optim.state_dict() if optim is not None else None
             torch.save(ckpt_out, ckpt_path)
 
-        if dc_diag is not None:
-            if optimizer_name == "selector":
-                assert selector is not None
-                dc_diag.maybe_run(
-                    it=it,
-                    model=model,
-                    get_batch=lambda split: openwebtext_get_batch(data_dir, split, batch_size, block_size, device),
-                    optimizer_name=selector.active_name,
-                    optimizer=selector.active_optimizer,
-                    bs_tokens=bs_tokens,
-                )
-            else:
-                assert optim is not None
-                dc_diag.maybe_run(
-                    it=it,
-                    model=model,
-                    get_batch=lambda split: openwebtext_get_batch(data_dir, split, batch_size, block_size, device),
-                    optimizer_name=optimizer_name,
-                    optimizer=optim,
-                    bs_tokens=bs_tokens,
-                )
-
-        if tail_diag is not None:
-            tail_diag.maybe_run(
-                it=it,
-                model=model,
-                get_batch=lambda split: openwebtext_get_batch(data_dir, split, batch_size, block_size, device),
-            )
-
-        if selector is not None:
-            selector.maybe_select(
-                step=it,
-                model=model,
-                get_batch=lambda split: openwebtext_get_batch(data_dir, split, batch_size, block_size, device),
-                bs_tokens=bs_tokens,
-            )
-
+    # finalize/close
     if dc_diag is not None:
         dc_diag.finalize()
 
@@ -722,3 +734,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

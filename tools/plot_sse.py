@@ -4,19 +4,20 @@
 """
 tools/plot_sse.py
 
-Readable SSE plots for component magnitudes |g_i| and |U_i| saved by c1bench/sse_diag.py.
+Paper-friendly SSE plots for component magnitudes |g_i| and |U_i| saved by c1bench/sse_diag.py.
 
-Key improvements (vs scatter):
-- Use 2D density (hexbin) in (log10|g|, log10|U|) instead of millions of points.
-- Overlay binned quantile summary: median + q10/q90 in log-|g| bins.
-- Add CCDF(|g_i|) and CCDF(|U_i|) pages (log-log) for each group (tail comparison).
-- Robust to slight g/u length mismatch: align by truncation to min(len).
-- Drops first aligned point to avoid iter=0 / lr=0 artifacts.
+What we show (reviewer-proof):
+- 2D density (hexbin) in (log10|g|, log10|U|) to avoid plotting millions of points.
+- Binned quantiles: q10 / median / q90 of |U| in log-|g| bins.
+- A tail-slope *on the upper envelope* (q90), not on the median:
+    log(q90|U|) ~ a + beta * log|g|   on tail bins
+  This is closer to SSE's "envelope" interpretation than median fits.
+- CCDF(|g_i|) and CCDF(|U_i|) pages (log-log) for each group.
 
 Outputs:
   <run_dir>/figures_sse/
-    - sse__iterXXXXXXX__ALL_GROUPS.pdf (multipage: per group)
-    - sse__iterXXXXXXX__<group>.pdf    (optional per-group)
+    - sse__iterXXXXXXX__ALL_GROUPS.pdf  (multipage)
+    - sse__iterXXXXXXX__<group>.pdf     (optional)
 
 Usage:
   python tools/plot_sse.py --run_dir out/A0_adamw_all_diag --mode iters --iters 200,800,1990
@@ -33,9 +34,6 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 
-# -----------------------------
-# Utils
-# -----------------------------
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
@@ -85,25 +83,18 @@ def _align_pair(g: np.ndarray, u: np.ndarray, drop_first: bool = True) -> Tuple[
     return g, u
 
 
-# -----------------------------
-# Plot helpers
-# -----------------------------
 def _binned_quantiles(
     x: np.ndarray,
     y: np.ndarray,
-    nbins: int = 40,
+    nbins: int = 45,
     q_lo: float = 0.10,
     q_hi: float = 0.90,
     min_per_bin: int = 200
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Bin x in log-space. For y in each bin: q10, median, q90.
-    Returns: centers, qlo, q50, qhi
-    """
     m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     x = x[m]
     y = y[m]
-    if x.size < 1000:
+    if x.size < 2000:
         return np.array([]), np.array([]), np.array([]), np.array([])
 
     xmin = float(np.quantile(x, 0.01))
@@ -129,16 +120,13 @@ def _binned_quantiles(
 
 
 def _ccdf_curve(x: np.ndarray, q_lo=0.001, q_hi=0.99999, nbins=700):
-    """
-    CCDF on log-spaced x-grid between quantiles.
-    Returns grid_x, ccdf
-    """
     x = x[np.isfinite(x)]
     x = x[x > 0]
-    if x.size < 1000:
+    if x.size < 2000:
         return np.array([]), np.array([])
     x = np.sort(x)
     n = x.size
+
     xmin = float(np.quantile(x, q_lo))
     xmax = float(np.quantile(x, q_hi))
     xmin = max(xmin, float(x[0]))
@@ -151,11 +139,7 @@ def _ccdf_curve(x: np.ndarray, q_lo=0.001, q_hi=0.99999, nbins=700):
     return g, cc
 
 
-def _fit_beta_tail_on_median(bx: np.ndarray, by: np.ndarray, qmin=0.80, qmax=0.98):
-    """
-    Fit log(by) = a + beta*log(bx) on tail bins (quantile window).
-    Returns beta, r2 or (nan,nan) if not enough.
-    """
+def _fit_beta_tail(bx: np.ndarray, by: np.ndarray, qmin=0.85, qmax=0.99, nonneg=True):
     if bx.size < 10:
         return np.nan, np.nan
     m = np.isfinite(bx) & np.isfinite(by) & (bx > 0) & (by > 0)
@@ -166,13 +150,19 @@ def _fit_beta_tail_on_median(bx: np.ndarray, by: np.ndarray, qmin=0.80, qmax=0.9
     lo = np.quantile(bx, qmin)
     hi = np.quantile(bx, qmax)
     mm = (bx >= lo) & (bx <= hi)
-    if mm.sum() < 5:
+    if int(mm.sum()) < 6:
         return np.nan, np.nan
 
     X = np.log(bx[mm])
     Y = np.log(by[mm])
-    slope, intercept = np.polyfit(X, Y, 1)
-    Yhat = intercept + slope * X
+
+    slope0, intercept0 = np.polyfit(X, Y, 1)
+    slope = float(slope0)
+    if nonneg and slope < 0:
+        slope = 0.0
+        intercept0 = float(np.mean(Y - slope * X))
+
+    Yhat = intercept0 + slope * X
     ss_res = float(np.sum((Y - Yhat) ** 2))
     ss_tot = float(np.sum((Y - np.mean(Y)) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
@@ -180,12 +170,9 @@ def _fit_beta_tail_on_median(bx: np.ndarray, by: np.ndarray, qmin=0.80, qmax=0.9
 
 
 def _plot_density_quantiles(ax, g, u, title: str):
-    """
-    2D density in log-space + quantile summary.
-    """
     m = np.isfinite(g) & np.isfinite(u) & (g > 0) & (u > 0)
     g = g[m]; u = u[m]
-    if g.size < 2000:
+    if g.size < 5000:
         ax.text(0.1, 0.5, "not enough points", transform=ax.transAxes)
         return
 
@@ -202,14 +189,19 @@ def _plot_density_quantiles(ax, g, u, title: str):
         ax.plot(np.log10(bx), np.log10(q10), linewidth=1.5, linestyle="--", label="q10/q90")
         ax.plot(np.log10(bx), np.log10(q90), linewidth=1.5, linestyle="--")
 
-        beta, r2 = _fit_beta_tail_on_median(bx, q50, qmin=0.80, qmax=0.98)
+        beta90, r2_90 = _fit_beta_tail(bx, q90, qmin=0.85, qmax=0.99, nonneg=True)
+
+        g_thr = float(np.quantile(g, 0.99))
+        u_tail = u[g >= g_thr]
+        u_q99_tail = float(np.quantile(u_tail, 0.99)) if u_tail.size >= 100 else float(np.max(u_tail)) if u_tail.size else np.nan
+
         ax.text(
             0.02, 0.98,
-            f"tail fit on median: beta={beta:.3g}, R²={r2:.3f}",
+            f"envelope tail (q90): beta={beta90:.3g}, R²={r2_90:.3f}\nU_q99@top1%g={u_q99_tail:.3g}",
             transform=ax.transAxes,
             va="top", ha="left",
             fontsize=10,
-            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none")
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="none")
         )
 
     ax.set_xlabel("log10 |g_i|")
@@ -220,9 +212,6 @@ def _plot_density_quantiles(ax, g, u, title: str):
 
 
 def _plot_ccdf_pair(ax, g_abs, u_abs, title: str):
-    """
-    CCDF(|g_i|) and CCDF(|U_i|) on log-log.
-    """
     gx, gcc = _ccdf_curve(g_abs, q_lo=0.001, q_hi=0.99999, nbins=700)
     ux, ucc = _ccdf_curve(u_abs, q_lo=0.001, q_hi=0.99999, nbins=700)
 
@@ -241,9 +230,6 @@ def _plot_ccdf_pair(ax, g_abs, u_abs, title: str):
     ax.legend(loc="best")
 
 
-# -----------------------------
-# Main plotting
-# -----------------------------
 def plot_one(npz_path: str, out_dir: str, groups: Optional[List[str]] = None, save_per_group: bool = False) -> None:
     it = _parse_iter(npz_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -259,74 +245,54 @@ def plot_one(npz_path: str, out_dir: str, groups: Optional[List[str]] = None, sa
     combined_path = os.path.join(out_dir, f"sse__iter{it:07d}__ALL_GROUPS.pdf")
     with PdfPages(combined_path) as combined:
         with np.load(npz_path) as z:
-            for grp in groups:
-                g = _get_arr(z, "g_abs", grp)
-                u = _get_arr(z, "u_abs", grp)
-                if g is None or u is None:
+            for group in groups:
+                g_abs = _get_arr(z, "g_abs", group)
+                u_abs = _get_arr(z, "u_abs", group)
+                if g_abs is None or u_abs is None:
                     continue
+                g_abs, u_abs = _align_pair(g_abs, u_abs, drop_first=True)
 
-                g, u = _align_pair(g, u, drop_first=True)
-                m = np.isfinite(g) & np.isfinite(u) & (g > 0) & (u > 0)
-                g = g[m]; u = u[m]
-                if g.size < 2000:
-                    continue
-
-                # Page 1: density + quantiles
-                fig = plt.figure(figsize=(8.5, 6.0))
-                ax = fig.add_subplot(111)
-                _plot_density_quantiles(ax, g, u, title=f"SSE (iter={it}, group={grp})")
+                fig = plt.figure(figsize=(8.6, 6.2))
+                ax = plt.gca()
+                _plot_density_quantiles(ax, g_abs, u_abs, title=f"iter {it} | group={group} | SSE cloud")
                 combined.savefig(fig, bbox_inches="tight")
                 if save_per_group:
-                    fig.savefig(os.path.join(out_dir, f"sse__iter{it:07d}__{grp}__density.pdf"), bbox_inches="tight")
+                    fig.savefig(os.path.join(out_dir, f"sse__iter{it:07d}__{group}__cloud.pdf"), bbox_inches="tight")
                 plt.close(fig)
 
-                # Page 2: CCDF(|g|) vs CCDF(|U|)
-                fig = plt.figure(figsize=(8.5, 5.5))
-                ax = fig.add_subplot(111)
-                _plot_ccdf_pair(ax, g, u, title=f"Component tails (iter={it}, group={grp})")
+                fig = plt.figure(figsize=(8.6, 6.2))
+                ax = plt.gca()
+                _plot_ccdf_pair(ax, g_abs, u_abs, title=f"iter {it} | group={group} | component tails")
                 combined.savefig(fig, bbox_inches="tight")
                 if save_per_group:
-                    fig.savefig(os.path.join(out_dir, f"sse__iter{it:07d}__{grp}__ccdf.pdf"), bbox_inches="tight")
+                    fig.savefig(os.path.join(out_dir, f"sse__iter{it:07d}__{group}__tails.pdf"), bbox_inches="tight")
                 plt.close(fig)
 
-    print(f"[ok] wrote {combined_path}")
+    print("[saved]", combined_path)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run_dir", required=True)
-    ap.add_argument("--out_dir", default=None)
-    ap.add_argument("--mode", choices=["latest", "iters", "all"], default="latest")
-    ap.add_argument("--iters", default="", help="comma-separated iters if mode=iters")
-    ap.add_argument("--groups", default="", help="comma-separated groups; default all")
-    ap.add_argument("--save_per_group", action="store_true", help="also save per-group PDFs")
+    ap.add_argument("--run_dir", type=str, required=True)
+    ap.add_argument("--mode", type=str, default="iters", choices=["iters"])
+    ap.add_argument("--iters", type=str, default="200,800,1990", help="comma list of iters to plot")
+    ap.add_argument("--groups", type=str, default="", help="optional comma list of groups; default=all in npz")
+    ap.add_argument("--save_per_group", action="store_true")
     args = ap.parse_args()
 
     run_dir = args.run_dir
-    out_dir = args.out_dir or os.path.join(run_dir, "figures_sse")
-    groups = [g.strip() for g in args.groups.split(",") if g.strip()] or None
+    out_dir = os.path.join(run_dir, "figures_sse")
+    os.makedirs(out_dir, exist_ok=True)
 
-    files = _list_npz(run_dir)
+    iters = [int(x.strip()) for x in args.iters.split(",") if x.strip()]
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()] if args.groups.strip() else None
 
-    if args.mode == "latest":
-        chosen = [files[-1]]
-    elif args.mode == "all":
-        chosen = files
-    else:
-        if not args.iters.strip():
-            raise ValueError("--mode iters requires --iters")
-        iters = [int(x.strip()) for x in args.iters.split(",") if x.strip()]
-        have = { _parse_iter(p): p for p in files }
-        chosen = []
-        for it in iters:
-            if it not in have:
-                raise FileNotFoundError(f"sse_iter{it:07d}.npz not found in {run_dir}/sse/")
-            chosen.append(have[it])
-
-    for p in chosen:
-        plot_one(p, out_dir, groups=groups, save_per_group=args.save_per_group)
+    npz_files = {_parse_iter(p): p for p in _list_npz(run_dir)}
+    for it in iters:
+        if it not in npz_files:
+            raise FileNotFoundError(f"Missing {run_dir}/sse/sse_iter{it:07d}.npz (available: {sorted(npz_files.keys())[:20]} ...)")
+        plot_one(npz_files[it], out_dir=out_dir, groups=groups, save_per_group=args.save_per_group)
 
 
 if __name__ == "__main__":
     main()
-    
